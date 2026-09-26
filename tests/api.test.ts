@@ -337,6 +337,20 @@ describe('KV 懒加载', () => {
   });
 });
 
+describe('路径尾斜杠兼容', () => {
+  it('/api/quotes/ 与 /api/quotes 等价', async () => {
+    const root = await call<Epigram[]>('/api/quotes/');
+    expect(root.res.status).toBe(200);
+    expect(root.body.data).toHaveLength(1);
+
+    const search = await call<Epigram[]>(
+      `/api/quotes/search/?q=${encodeURIComponent('人生')}`
+    );
+    expect(search.res.status).toBe(200);
+    expect(search.body.data.length).toBeGreaterThan(0);
+  });
+});
+
 describe('未匹配路由', () => {
   it('返回结构化 404', async () => {
     const { res, body } = await call<null>('/api/not-exist');

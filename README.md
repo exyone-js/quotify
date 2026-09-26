@@ -69,6 +69,7 @@ epigram/
 
 状态码约定：`200` 成功 / `400` 参数错误 / `401` 未授权 / `404` 未找到 / `429` 限流 / `500` 服务器错误。
 所有响应都带 `Access-Control-Allow-Origin: *`。
+路径末尾的斜杠会被忽略：`/api/quotes` 与 `/api/quotes/` 等价（Hono 以 `strict: false` 启动）。
 
 ### `GET /api/quotes` — 随机一言
 

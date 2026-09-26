@@ -7,7 +7,10 @@ import type { Env } from './types/env';
 import { toErrorResponse } from './utils/error';
 import { fail, ok } from './utils/response';
 
-const app = new Hono<{ Bindings: Env }>();
+// Hono 的 strict 默认为 true，会把 `/api/quotes` 与 `/api/quotes/` 视作两条不同路由。
+// 对公开 API 来说尾斜杠应当被容忍（浏览器、代理、手写 URL 都可能带上），故显式关闭。
+// 关闭后 getPath 会把请求路径的尾斜杠归一化掉，子路由同理。
+const app = new Hono<{ Bindings: Env }>({ strict: false });
 
 // 1. CORS：所有接口（含错误响应）都带跨域头，并短路 OPTIONS 预检。
 app.use('*', cors());

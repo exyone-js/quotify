@@ -1,0 +1,31 @@
+name = "epigram-api"
+main = "src/index.ts"
+# 注意：本地测试链路（@cloudflare/vitest-pool-workers 内置的 miniflare/workerd）
+# 目前支持到 2026-08-22，因此这里取 2026-08-01 以保证 dev / test / deploy 三端一致。
+compatibility_date = "2026-08-01"
+
+[vars]
+ENVIRONMENT = "production"
+# 数据源：指向 epigram-data 仓库中的 data.json（部署前把 <owner> 换成真实 GitHub 用户名）
+DATA_URL = "https://raw.githubusercontent.com/exyone-js/epigram-data/main/data.json"
+DATA_TTL = "300"
+# 本地开发默认值；生产环境请用 `wrangler secret put ADMIN_TOKEN` 覆盖
+ADMIN_TOKEN = "dev-secret-token"
+
+[[kv_namespaces]]
+binding = "CACHE"
+# TODO: 执行 `npx wrangler kv namespace create epigram-cache` 后填入真实 id
+id = "b38989b10a4d4a119bd6bb8adc93e21b"
+
+[[ratelimits]]
+name = "PUBLIC_RATE_LIMITER"
+namespace_id = "1001"
+simple = { limit = 60, period = 60 }
+
+[[ratelimits]]
+name = "ADMIN_RATE_LIMITER"
+namespace_id = "1002"
+simple = { limit = 10, period = 60 }
+
+[observability]
+enabled = true

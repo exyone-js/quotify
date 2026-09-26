@@ -1,0 +1,24 @@
+{
+  "name": "epigram-api",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Production-grade epigram (quote) API on Cloudflare Workers, backed by a GitHub-hosted JSON dataset with KV lazy caching.",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "cf-typegen": "wrangler types"
+  },
+  "dependencies": {
+    "hono": "^4.13.9"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.22.0",
+    "typescript": "^5",
+    "vitest": "^4.1.11",
+    "wrangler": "^4.141.0"
+  }
+}

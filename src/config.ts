@@ -1,9 +1,9 @@
 import type { Env } from './types/env';
 
-/** KV 键：完整数据集（换数据结构时升版为 v2，避免旧缓存污染）。 */
-export const DATA_KEY = 'epigram:data:v1';
+/** KV 键：完整数据集（换数据结构时升版避免旧缓存污染，当前为 v2：字段 epigrams → quotes）。 */
+export const DATA_KEY = 'epigram:data:v2';
 /** KV 键：缓存元信息。 */
-export const META_KEY = 'epigram:meta:v1';
+export const META_KEY = 'epigram:meta:v2';
 
 /** 数据集默认地址；与 `wrangler.toml` 的 `DATA_URL` 保持一致。 */
 export const DEFAULT_DATA_URL =

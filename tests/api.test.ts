@@ -15,7 +15,7 @@ interface Envelope<T> {
   ts: number;
 }
 
-interface Epigram {
+interface Quote {
   id: string;
   content: string;
   source?: string;
@@ -28,7 +28,7 @@ interface Epigram {
 const DATASET = {
   version: 1,
   updated_at: '2026-09-26T12:00:00Z',
-  epigrams: [
+  quotes: [
     {
       id: 'e1f3a2',
       content: '人生如逆旅，我亦是行人。',
@@ -112,8 +112,8 @@ const DATASET = {
   ],
 };
 
-const DATA_KEY = 'epigram:data:v1';
-const META_KEY = 'epigram:meta:v1';
+const DATA_KEY = 'epigram:data:v2';
+const META_KEY = 'epigram:meta:v2';
 const BASE = 'https://epigram.test';
 const ADMIN_TOKEN = 'dev-secret-token';
 
@@ -167,7 +167,7 @@ describe('GET /api/health', () => {
 
 describe('GET /api/quotes', () => {
   it('2. 随机返回一条合法数据', async () => {
-    const { res, body } = await call<Epigram[]>('/api/quotes');
+    const { res, body } = await call<Quote[]>('/api/quotes');
 
     expect(res.status).toBe(200);
     expect(Array.isArray(body.data)).toBe(true);
@@ -181,7 +181,7 @@ describe('GET /api/quotes', () => {
   });
 
   it('3. limit=5 返回 5 条且 id 不重复', async () => {
-    const { res, body } = await call<Epigram[]>('/api/quotes?limit=5');
+    const { res, body } = await call<Quote[]>('/api/quotes?limit=5');
 
     expect(res.status).toBe(200);
     expect(body.data).toHaveLength(5);
@@ -191,7 +191,7 @@ describe('GET /api/quotes', () => {
   });
 
   it('4. category=文学 结果分类全部匹配', async () => {
-    const { res, body } = await call<Epigram[]>(
+    const { res, body } = await call<Quote[]>(
       `/api/quotes?category=${encodeURIComponent('文学')}&limit=5`
     );
 
@@ -203,7 +203,7 @@ describe('GET /api/quotes', () => {
   });
 
   it('5. tag=古诗,人生 至少命中一个标签', async () => {
-    const { res, body } = await call<Epigram[]>(
+    const { res, body } = await call<Quote[]>(
       `/api/quotes?tag=${encodeURIComponent('古诗,人生')}&limit=5`
     );
 
@@ -234,7 +234,7 @@ describe('GET /api/quotes', () => {
 
 describe('GET /api/quotes/search', () => {
   it('6. q=人生 结果包含关键词', async () => {
-    const { res, body } = await call<Epigram[]>(
+    const { res, body } = await call<Quote[]>(
       `/api/quotes/search?q=${encodeURIComponent('人生')}`
     );
 
@@ -294,19 +294,19 @@ describe('POST /api/admin/refresh', () => {
 
     expect(res.status).toBe(200);
     expect(body.data.refreshed).toBe(true);
-    expect(body.data.total).toBe(DATASET.epigrams.length);
+    expect(body.data.total).toBe(DATASET.quotes.length);
 
     const cached = await env.CACHE.get(DATA_KEY);
     expect(cached).not.toBeNull();
   });
 
   it('上游数据非法时返回 500，且不污染已有缓存', async () => {
-    await call<Epigram[]>('/api/quotes');
+    await call<Quote[]>('/api/quotes');
     const before = await env.CACHE.get(DATA_KEY);
     expect(before).not.toBeNull();
 
     vi.stubGlobal('fetch', async () =>
-      new Response(JSON.stringify({ version: 1, epigrams: [{ id: 'broken' }] }), { status: 200 })
+      new Response(JSON.stringify({ version: 1, quotes: [{ id: 'broken' }] }), { status: 200 })
     );
 
     const { res } = await call<null>('/api/admin/refresh', {
@@ -339,7 +339,7 @@ describe('根路径重定向', () => {
     const res = await SELF.fetch(`${BASE}/`);
 
     expect(res.status).toBe(200);
-    const body = (await res.json()) as Envelope<Epigram[]>;
+    const body = (await res.json()) as Envelope<Quote[]>;
     expect(Array.isArray(body.data)).toBe(true);
     expect(body.data).toHaveLength(1);
   });
@@ -374,11 +374,11 @@ describe('KV 懒加载', () => {
   it('12. KV 为空时首次请求自动回源，之后命中缓存', async () => {
     expect(await env.CACHE.get(DATA_KEY)).toBeNull();
 
-    const first = await call<Epigram[]>('/api/quotes');
+    const first = await call<Quote[]>('/api/quotes');
     expect(first.res.status).toBe(200);
     expect(upstreamCalls).toBe(1);
 
-    const second = await call<Epigram[]>('/api/quotes');
+    const second = await call<Quote[]>('/api/quotes');
     expect(second.res.status).toBe(200);
     expect(upstreamCalls).toBe(1);
 
@@ -389,11 +389,11 @@ describe('KV 懒加载', () => {
 
 describe('路径尾斜杠兼容', () => {
   it('/api/quotes/ 与 /api/quotes 等价', async () => {
-    const root = await call<Epigram[]>('/api/quotes/');
+    const root = await call<Quote[]>('/api/quotes/');
     expect(root.res.status).toBe(200);
     expect(root.body.data).toHaveLength(1);
 
-    const search = await call<Epigram[]>(
+    const search = await call<Quote[]>(
       `/api/quotes/search/?q=${encodeURIComponent('人生')}`
     );
     expect(search.res.status).toBe(200);
@@ -497,14 +497,14 @@ describe('健壮性', () => {
     await env.CACHE.put(DATA_KEY, '{ 这不是合法 JSON', { expirationTtl: 300 });
     await env.CACHE.put(META_KEY, '同样损坏', { expirationTtl: 300 });
 
-    const { res, body } = await call<Epigram[]>('/api/quotes');
+    const { res, body } = await call<Quote[]>('/api/quotes');
 
     expect(res.status).toBe(200);
     expect(body.data).toHaveLength(1);
 
     // 损坏值已被合法数据覆盖，元信息也被重写。
     const repaired = await env.CACHE.get(DATA_KEY);
-    expect(repaired).toContain('"epigrams"');
+    expect(repaired).toContain('"quotes"');
     expect(await env.CACHE.get(META_KEY)).toContain('source_url');
   });
 
@@ -518,10 +518,10 @@ describe('健壮性', () => {
   });
 
   it('limit 超过上限时收敛，不会超出数据集总量', async () => {
-    const { res, body } = await call<Epigram[]>('/api/quotes?limit=999');
+    const { res, body } = await call<Quote[]>('/api/quotes?limit=999');
 
     expect(res.status).toBe(200);
-    expect(body.data.length).toBe(DATASET.epigrams.length);
+    expect(body.data.length).toBe(DATASET.quotes.length);
   });
 
   it('上游 304 时复用缓存并续期，不重新写入正文', async () => {
@@ -560,7 +560,7 @@ describe('健壮性', () => {
 
     expect(sawConditional).toBe(true);
     expect(refreshed.res.status).toBe(200);
-    expect(refreshed.body.data.total).toBe(DATASET.epigrams.length);
+    expect(refreshed.body.data.total).toBe(DATASET.quotes.length);
   });
 
   it('上游 304 但本地无缓存时返回 500 而不是死循环', async () => {
@@ -583,7 +583,7 @@ describe('GET /api/admin/stats', () => {
     }>('/api/admin/stats', { headers: { Authorization: `Bearer ${ADMIN_TOKEN}` } });
 
     expect(res.status).toBe(200);
-    expect(body.data.total).toBe(DATASET.epigrams.length);
+    expect(body.data.total).toBe(DATASET.quotes.length);
     expect(body.data.categories).toBe(3);
     expect(body.data.version).toBe(1);
     expect(body.data.updated_at).toBe(DATASET.updated_at);

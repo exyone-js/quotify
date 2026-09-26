@@ -23,7 +23,7 @@ admin.post('/refresh', async (c) => {
 
   return ok({
     refreshed: true,
-    total: dataset.epigrams.length,
+    total: dataset.quotes.length,
     loaded_at: loadedAt,
     source_url: resolveDataUrl(c.env),
   });
@@ -34,9 +34,9 @@ admin.get('/stats', async (c) => {
   const { dataset, cached, loadedAt } = await loadDatasetWithMeta(c.env);
 
   return ok({
-    total: dataset.epigrams.length,
-    categories: collectCategories(dataset.epigrams).length,
-    tags: collectTags(dataset.epigrams).length,
+    total: dataset.quotes.length,
+    categories: collectCategories(dataset.quotes).length,
+    tags: collectTags(dataset.quotes).length,
     version: dataset.version,
     updated_at: dataset.updated_at,
     cached,

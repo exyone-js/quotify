@@ -9,18 +9,18 @@ import {
 } from '../config';
 import type { Env } from '../types/env';
 import { UpstreamError } from '../utils/error';
-import type { DatasetMeta, Epigram, EpigramDataset } from './types';
+import type { DatasetMeta, Quote, QuoteDataset } from './types';
 
 /** 加载结果：数据集本身 + 是否命中缓存 + 缓存写入时间。 */
 export interface LoadResult {
-  dataset: EpigramDataset;
+  dataset: QuoteDataset;
   cached: boolean;
   loadedAt: number | null;
 }
 
 /** KV 快照：在 LoadResult 之上额外保留原始文本与上游 ETag，供条件请求复用。 */
 interface CacheSnapshot {
-  dataset: EpigramDataset;
+  dataset: QuoteDataset;
   /** 写入 KV 的原始 JSON 文本；304 续期时原样回写，避免重新序列化。 */
   raw: string;
   loadedAt: number | null;
@@ -90,9 +90,9 @@ function readOptionalTags(record: Record<string, unknown>, index: number): strin
  * 校验数据集结构。非法数据直接抛错（由顶层转成 500），不静默丢弃。
  *
  * 这里做的是「校验 + 归一」：只保留已知字段，缺失的可选字段置为 undefined，
- * 因此返回值可以安全地当作 `Epigram` 使用，无需下游再做类型兜底。
+ * 因此返回值可以安全地当作 `Quote` 使用，无需下游再做类型兜底。
  */
-export function validateDataset(input: unknown): EpigramDataset {
+export function validateDataset(input: unknown): QuoteDataset {
   if (typeof input !== 'object' || input === null || Array.isArray(input)) {
     throw new UpstreamError('数据集格式非法：根节点必须是对象。');
   }
@@ -102,11 +102,11 @@ export function validateDataset(input: unknown): EpigramDataset {
   if (typeof root.version !== 'number' || !Number.isFinite(root.version)) {
     throw new UpstreamError('数据集格式非法：version 必须是数字。');
   }
-  if (!Array.isArray(root.epigrams)) {
-    throw new UpstreamError('数据集格式非法：epigrams 必须是数组。');
+  if (!Array.isArray(root.quotes)) {
+    throw new UpstreamError('数据集格式非法：quotes 必须是数组。');
   }
 
-  const epigrams: Epigram[] = root.epigrams.map((item, index) => {
+  const quotes: Quote[] = root.quotes.map((item, index) => {
     if (typeof item !== 'object' || item === null || Array.isArray(item)) {
       throw new UpstreamError(`数据集格式非法：第 ${index} 条记录不是对象。`);
     }
@@ -134,12 +134,12 @@ export function validateDataset(input: unknown): EpigramDataset {
   return {
     version: root.version,
     updated_at: typeof root.updated_at === 'string' ? root.updated_at : '',
-    epigrams,
+    quotes,
   };
 }
 
 /** 把上游原始文本解析为数据集：JSON 解析失败与结构非法都归一为 UpstreamError。 */
-export function parseDataset(raw: string): EpigramDataset {
+export function parseDataset(raw: string): QuoteDataset {
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
@@ -306,7 +306,7 @@ export async function loadDatasetWithMeta(env: Env): Promise<LoadResult> {
 }
 
 /** 只需要数据集时的便捷封装。 */
-export async function loadDataset(env: Env): Promise<EpigramDataset> {
+export async function loadDataset(env: Env): Promise<QuoteDataset> {
   const { dataset } = await loadDatasetWithMeta(env);
   return dataset;
 }
@@ -317,10 +317,10 @@ export async function peekCache(
 ): Promise<{ cached: boolean; loadedAt: number | null; total: number }> {
   const hot = readMemory(resolveDataUrl(env));
   if (hot !== null) {
-    return { cached: true, loadedAt: hot.loadedAt, total: hot.dataset.epigrams.length };
+    return { cached: true, loadedAt: hot.loadedAt, total: hot.dataset.quotes.length };
   }
 
   const snapshot = await readSnapshot(env);
   if (snapshot === null) return { cached: false, loadedAt: null, total: 0 };
-  return { cached: true, loadedAt: snapshot.loadedAt, total: snapshot.dataset.epigrams.length };
+  return { cached: true, loadedAt: snapshot.loadedAt, total: snapshot.dataset.quotes.length };
 }

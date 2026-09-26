@@ -17,7 +17,7 @@ import {
   randomPick,
   search,
 } from '../data/store';
-import type { EpigramDataset } from '../data/types';
+import type { QuoteDataset } from '../data/types';
 import { publicRateLimit } from '../middleware/rateLimit';
 import type { Env } from '../types/env';
 import { ApiError, parseCsv, parseLimit, parseOffset } from '../utils/error';
@@ -40,7 +40,7 @@ function parseFormat(raw: string | undefined): 'json' | 'text' {
  */
 function respondCatalog(
   c: Context<{ Bindings: Env }>,
-  dataset: EpigramDataset,
+  dataset: QuoteDataset,
   data: string[]
 ): Response {
   const etag = datasetEtag(dataset);
@@ -58,7 +58,7 @@ quotes.get('/', async (c) => {
   const format = parseFormat(c.req.query('format'));
 
   const { dataset } = await loadDatasetWithMeta(c.env);
-  const filtered = applyFilters(dataset.epigrams, { categories, tags });
+  const filtered = applyFilters(dataset.quotes, { categories, tags });
   if (filtered.length === 0) {
     throw ApiError.notFound('没有符合条件的一言。');
   }
@@ -88,7 +88,7 @@ quotes.get('/search', async (c) => {
   const offset = parseOffset(c.req.query('offset'));
 
   const { dataset } = await loadDatasetWithMeta(c.env);
-  const matched = search(applyFilters(dataset.epigrams, { categories, tags }), q);
+  const matched = search(applyFilters(dataset.quotes, { categories, tags }), q);
 
   return ok(paginate(matched, limit, offset));
 });
@@ -96,13 +96,13 @@ quotes.get('/search', async (c) => {
 /** GET /api/quotes/categories —— 所有分类（去重、字典序）。 */
 quotes.get('/categories', async (c) => {
   const { dataset } = await loadDatasetWithMeta(c.env);
-  return respondCatalog(c, dataset, collectCategories(dataset.epigrams));
+  return respondCatalog(c, dataset, collectCategories(dataset.quotes));
 });
 
 /** GET /api/quotes/tags —— 所有标签（去重、字典序）。 */
 quotes.get('/tags', async (c) => {
   const { dataset } = await loadDatasetWithMeta(c.env);
-  return respondCatalog(c, dataset, collectTags(dataset.epigrams));
+  return respondCatalog(c, dataset, collectTags(dataset.quotes));
 });
 
 export default quotes;

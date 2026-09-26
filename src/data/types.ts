@@ -1,5 +1,5 @@
-/** 单条一言。 */
-export interface Epigram {
+/** 单条引语（公开 API 中即一个 quote 资源）。 */
+export interface Quote {
   id: string;
   content: string;
   source?: string;
@@ -9,13 +9,13 @@ export interface Epigram {
 }
 
 /** GitHub 仓库 `epigram-data/data.json` 的完整结构。 */
-export interface EpigramDataset {
+export interface QuoteDataset {
   version: number;
   updated_at: string;
-  epigrams: Epigram[];
+  quotes: Quote[];
 }
 
-/** `epigram:meta:v1` 中保存的缓存元信息。 */
+/** `epigram:meta:v2` 中保存的缓存元信息。 */
 export interface DatasetMeta {
   loaded_at: number;
   source_url: string;

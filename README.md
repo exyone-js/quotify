@@ -1,6 +1,9 @@
-# epigram · 一言 API
+# epigram · 隽语 API
 
-运行在 **Cloudflare Workers** 上的生产级一言（quotes / epigram）API。
+> 中文名 **隽语**（即 `epigram` 的意译），是一个仿「一言（Hitokoto）」的引语 API 实现。
+> 功能定位参考一言（随机返回一条或多条引语），但接口约定自成一套，**并非** Hitokoto 的兼容实现。
+
+运行在 **Cloudflare Workers** 上的生产级引语 API：随机返回引语，并支持分类 / 标签筛选与关键词搜索。
 数据源不是数据库，而是 **GitHub 仓库中的 `data.json`**；运行时通过 **Cloudflare KV 懒加载缓存**，
 所有筛选 / 搜索 / 随机操作在 Worker 内存中完成。不使用 D1，不使用任何 Node.js 专有 API。
 
@@ -20,7 +23,7 @@ GitHub 仓库 (epigram-data)
    ▼
 Cloudflare Worker (epigram-api)
    │  1. 进程内热缓存（60s，避免每请求重复解析）—— 命中即返回
-   │  2. 查 KV 缓存 (epigram:data:v1)
+   │  2. 查 KV 缓存 (epigram:data:v2)
    │  3. 未命中 / 过期 → fetch raw.githubusercontent.com
    │     （5s 超时 + 边缘缓存 60s；携带 If-None-Match，304 则复用旧数据并续期）
    │  4. 校验 JSON → 回写 KV (TTL 300s) + meta（含上游 ETag）
@@ -46,7 +49,7 @@ epigram/
 │   ├── data/
 │   │   ├── loader.ts         # 热缓存 / KV / GitHub 懒加载 + 条件请求 + 数据校验
 │   │   ├── store.ts          # 内存查询（filter / search / random / paginate）+ 派生索引记忆化
-│   │   └── types.ts          # Epigram / EpigramDataset 类型
+│   │   └── types.ts          # Quote / QuoteDataset 类型
 │   ├── middleware/
 │   │   ├── security.ts       # 通用安全响应头
 │   │   ├── cors.ts           # CORS + OPTIONS 预检
@@ -65,6 +68,26 @@ epigram/
 ├── tsconfig.json
 └── package.json
 ```
+
+## 命名约定
+
+项目只用两个词，各司其职，避免同一概念出现多种叫法：
+
+| 层 | 用词 | 示例 |
+|:---|:---|:---|
+| 公开契约 + 数据模型 | `quote` | `GET /api/quotes`、数据集字段 `quotes`、类型 `Quote` / `QuoteDataset` |
+| 项目 / 品牌标识 | `epigram` | 包名 `epigram-api`、KV 键前缀 `epigram:`、`service: "epigram"` |
+
+公开接口、数据集字段与代码类型统一使用通用的 `quote`：
+
+- **语义准确**：本 API 收录的是「有出处、有作者的引语」——诗词、骈文、戏剧台词、箴言、讲义摘句，
+  正是 `quote` / `quotation` 的范畴；相比之下 `epigram`（多指机智、带讽刺的短句）语义偏窄。
+- **契约友好**：路径与数据集字段是长期对外契约且最难变更，通用词对使用者更友好，
+  也是这类 API 的通行叫法。
+
+`epigram` 仅作为项目品牌保留在包名、KV 键前缀与服务标识中，不再出现在对外契约里。
+
+> 中文名「**隽语**」是 `epigram` 的意译，仅用于对外称呼与文档表述，不参与任何标识符命名。
 
 ## API 文档
 
@@ -161,7 +184,7 @@ epigram/
 {
   "version": 1,
   "updated_at": "2026-09-26T12:00:00Z",
-  "epigrams": [
+  "quotes": [
     {
       "id": "e1f3a2",
       "content": "人生如逆旅，我亦是行人。",
@@ -177,7 +200,7 @@ epigram/
 校验规则（`src/data/loader.ts`）：
 
 - `version` 必须是数字。
-- `epigrams` 必须是数组。
+- `quotes` 必须是数组。
 - 每条记录必须含非空字符串 `id` 与 `content`。
 - `source` / `author` / `category` 可选，若存在必须是字符串；`tags` 可选，若存在必须是字符串数组。
 - 非法数据直接返回 `500` 并记录日志，**不会**静默丢弃，也**不会**写入 KV。
@@ -188,16 +211,16 @@ KV 键设计：
 
 | 键 | 值 | 说明 |
 |:---|:---|:---|
-| `epigram:data:v1` | JSON 字符串 | 完整数据集 |
-| `epigram:meta:v1` | JSON 字符串 | `{ loaded_at, source_url }` |
+| `epigram:data:v2` | JSON 字符串 | 完整数据集 |
+| `epigram:meta:v2` | JSON 字符串 | `{ loaded_at, source_url, etag? }`（`etag` 为上游 ETag，用于条件请求） |
 
-数据结构升级时把版本后缀换成 `v2`，避免旧缓存污染。
+数据结构升级时把版本后缀递增（当前为 `v2`：数据集字段由 `epigrams` 更名为 `quotes`），避免旧缓存结构污染。
 
 ## 环境变量
 
 | 名称 | 类型 | 默认 | 说明 |
 |:---|:---|:---|:---|
-| `DATA_URL` | var | `https://raw.githubusercontent.com/<owner>/epigram-data/main/data.json` | 数据集地址 |
+| `DATA_URL` | var | 作者维护的 `epigram-data` 仓库 raw 地址 | 数据集地址（**Fork 后请换成自己的**，见「自建部署教程」） |
 | `DATA_TTL` | var | `300` | KV 缓存 TTL（秒） |
 | `ROOT_REDIRECT` | var | `/api/quotes/` | 根路径 302 重定向目标（仅接受站内绝对路径） |
 | `ENVIRONMENT` | var | `production` | 环境标识 |
@@ -236,20 +259,114 @@ npm run cf-typegen # 修改 wrangler.toml 后重新生成 worker-configuration.d
 > `worker-configuration.d.ts` 由 `wrangler types` 生成（包含 `KVNamespace`、`RateLimit` 等运行时类型
 > 以及全局 `Env`），修改 `wrangler.toml` 后需要重新生成。
 
-## 部署
+## 自建部署教程（Fork 并托管自己的隽语 API）
+
+面向「Fork 一份、换成自己的数据集、部署到自己的 Cloudflare 账号」的场景。
+下面每一步都对应 `wrangler.toml` 里的注释，照着改即可。
+
+### 0. 前置条件
+
+- 一个 Cloudflare 账号（Workers Free 计划即可）
+- 已把本仓库 Fork 到你的 GitHub 账号并 clone 到本地
+- 本地执行过 `npm install`（Wrangler 是项目依赖，统一用 `npx wrangler` 调用）
+- 已执行 `npx wrangler login` 完成授权
+
+### 1. 准备你自己的数据集
+
+新建一个 GitHub 仓库（例如 `my-quotes-data`），在根目录放 `data.json`，
+格式见上文「数据仓库格式」——**根字段必须是 `quotes`**，每条记录至少要有非空的 `id` 与 `content`。
+可以直接复制本仓库的 [data/data.json](data/data.json) 当模板，把条目替换成你自己的。
+
+> `wrangler.toml` 中 `DATA_URL` 的注释写着「任意公网可访问、且返回符合本项目数据格式的 JSON 的链接都可以」——
+> 也就是说数据集**不一定要放在 GitHub**，你自己的静态服务器 / 对象存储同样可行，只要 URL 公网可读。
+
+### 2. 把 `DATA_URL` 指向你自己的数据集
+
+```toml
+[vars]
+DATA_URL = "https://raw.githubusercontent.com/<你的用户名>/my-quotes-data/main/data.json"
+```
+
+> 对应注释：「默认指向作者维护的 epigram-data 仓库；Fork 后请替换成你自己的仓库地址，**否则你改不动数据**」。
+> 保持默认值时，你的实例会一直读取作者的数据集，自己改数据不会有任何效果。
+
+### 3. 创建你自己的 KV 命名空间
 
 ```bash
-# 1. 创建 KV 命名空间 epigram-cache，把输出的 id 填入 wrangler.toml
 npx wrangler kv namespace create epigram-cache
+```
 
-# 2. 设置管理 Token（生产环境）
+命令会输出一个 `id`，用它覆盖 `wrangler.toml` 里 `[[kv_namespaces]].id`：
+
+```toml
+[[kv_namespaces]]
+binding = "CACHE"
+id = "<上一步输出的 id>"
+```
+
+> 对应注释：「下面的 id 属于本项目作者，Fork 后你无权访问，必须换成自己的」。
+> KV 命名空间 id 本身是公开信息、不是密钥，但它绑定在作者账号下，你无法读写。
+
+### 4. 设置管理接口 Token
+
+`wrangler.toml` 里的 `ADMIN_TOKEN = "dev-secret-token"` 只是本地开发默认值，生产环境必须用 secret 覆盖：
+
+```bash
 npx wrangler secret put ADMIN_TOKEN
+```
 
-# 3. 把 [vars].DATA_URL 中的 <owner> 换成真实 GitHub 用户名
+> 对应注释：「本地开发默认值；生产环境请用 `wrangler secret put ADMIN_TOKEN` 覆盖」。
+> secret 优先级高于同名 var，且不会进入仓库。
 
-# 4. 部署
+### 5. 按需调整其它变量
+
+| 变量 | 是否必须改 | 说明 |
+|:---|:---|:---|
+| `ROOT_REDIRECT` | 否 | 访问根域时的 302 目标，默认 `/api/quotes/`；只接受站内绝对路径 |
+| `DATA_TTL` | 否 | KV 缓存 TTL（秒），默认 `300` |
+| `ENVIRONMENT` | 否 | 环境标识，会出现在 `/api/health` 响应中 |
+| `[[ratelimits]].namespace_id` | 建议 | 见下方说明 |
+
+> 对应注释：「访问根域（`/`）时 302 跳转的目标（站内绝对路径），默认指向公开随机一言接口」。
+>
+> ⚠️ **限流绑定的 `namespace_id`** 是「账号内唯一」的标识：同一账号下若已有 Worker 用了 `1001` / `1002`，
+> 两者会共享同一份限流计数。若遇到意料之外的 429，把它们改成不冲突的数字。
+
+### 6. 部署
+
+```bash
 npx wrangler deploy
 ```
+
+部署完成后终端会输出形如 `https://epigram-api.<你的子域>.workers.dev` 的访问地址。
+
+### 7. 首次预热与验证
+
+```bash
+BASE=https://epigram-api.<你的子域>.workers.dev
+
+curl "$BASE/api/health"      # 首次：cached=false、total=0（KV 还是空的）
+curl "$BASE/api/quotes"      # 触发首次回源，返回你自己的数据
+curl "$BASE/api/health"      # 再次：cached=true、total 与你的数据集条数一致
+
+# 主动刷新缓存（需要第 4 步设置的 Token）
+curl -X POST -H "Authorization: Bearer <你的 ADMIN_TOKEN>" "$BASE/api/admin/refresh"
+```
+
+完整验收项见文末「生产验证清单」。
+
+### 8. 以后如何更新数据集
+
+只需修改你数据仓库里的 `data.json` 并提交。Worker 会在 KV 过期（`DATA_TTL`，默认 300 秒）后
+自动拉到新数据；想立即生效，调一次 `POST /api/admin/refresh`。
+
+### 常见问题
+
+- **访问根域 404？** 根域会自动 302 到 `/api/quotes/`；若你改过 `ROOT_REDIRECT`，确认它是站内绝对路径（以单个 `/` 开头）。
+- **`/api/quotes` 一直返回 500？** 通常是数据集格式不合规：根字段不是 `quotes`，或某条记录缺 `id` / `content`。
+  校验不通过时不会写入缓存，日志里会指出是第几条、哪个字段。
+- **管理接口返回 401？** 检查请求头为 `Authorization: Bearer <token>`，且 token 与 `ADMIN_TOKEN` 一致（secret 优先于 var）。
+- **改了 `wrangler.toml` 后类型报错？** 执行 `npm run cf-typegen` 重新生成 `worker-configuration.d.ts`。
 
 ## curl 调用示例清单
 

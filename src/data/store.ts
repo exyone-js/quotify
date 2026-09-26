@@ -1,4 +1,4 @@
-import type { Epigram } from './types';
+import type { Epigram, EpigramDataset } from './types';
 
 /** Fisher–Yates 洗牌（返回新数组）。 */
 function shuffle(list: Epigram[]): Epigram[] {
@@ -10,21 +10,21 @@ function shuffle(list: Epigram[]): Epigram[] {
   return result;
 }
 
-/** 随机取 n 条，保证不重复。 */
+/**
+ * 随机取 n 条，保证不重复。
+ *
+ * 采用「部分 Fisher–Yates」：只在副本的前 n 个位置做交换，
+ * 复杂度稳定为 O(n)，且不会像拒绝采样那样在高填充率下反复重试。
+ */
 export function randomPick(list: Epigram[], n: number): Epigram[] {
-  if (list.length <= n) return shuffle(list);
+  if (n >= list.length) return shuffle(list);
 
-  const result: Epigram[] = [];
-  const used = new Set<number>();
-  while (result.length < n) {
-    const i = Math.floor(Math.random() * list.length);
-    const item = list[i];
-    if (item !== undefined && !used.has(i)) {
-      used.add(i);
-      result.push(item);
-    }
+  const pool = [...list];
+  for (let i = 0; i < n; i += 1) {
+    const j = i + Math.floor(Math.random() * (pool.length - i));
+    [pool[i], pool[j]] = [pool[j], pool[i]];
   }
-  return result;
+  return pool.slice(0, n);
 }
 
 export interface FilterOptions {
@@ -48,17 +48,28 @@ export function applyFilters(list: Epigram[], opts: FilterOptions): Epigram[] {
   });
 }
 
+/**
+ * 单条记录的小写检索文本（content / author / source 以 U+0000 拼接）。
+ *
+ * 以记录对象为键做 WeakMap 记忆化：同一份数据集在热缓存存活期内被反复检索时，
+ * 无需每个请求都重新 toLowerCase 全量文本。分隔符用 U+0000，
+ * 正常关键词不会包含它，因此跨字段误匹配不可能发生。
+ */
+const lowerTextCache = new WeakMap<Epigram, string>();
+
+function lowerText(e: Epigram): string {
+  const cached = lowerTextCache.get(e);
+  if (cached !== undefined) return cached;
+  const text = `${e.content}\u0000${e.author ?? ''}\u0000${e.source ?? ''}`.toLowerCase();
+  lowerTextCache.set(e, text);
+  return text;
+}
+
 /** 关键词搜索：大小写不敏感，匹配 content / author / source。 */
 export function search(list: Epigram[], q: string): Epigram[] {
   const kw = q.trim().toLowerCase();
   if (!kw) return [];
-  return list.filter((e) => {
-    return (
-      e.content.toLowerCase().includes(kw) ||
-      (e.author?.toLowerCase().includes(kw) ?? false) ||
-      (e.source?.toLowerCase().includes(kw) ?? false)
-    );
-  });
+  return list.filter((e) => lowerText(e).includes(kw));
 }
 
 /** 分页。 */
@@ -66,20 +77,50 @@ export function paginate(list: Epigram[], limit: number, offset: number): Epigra
   return list.slice(offset, offset + limit);
 }
 
-/** 收集去重后的分类（字典序）。 */
-export function collectCategories(list: Epigram[]): string[] {
+/** 去重、去空并按拼音排序。 */
+function collectUnique(values: readonly (string | undefined)[]): string[] {
   const set = new Set<string>();
-  for (const e of list) {
-    if (e.category) set.add(e.category);
+  for (const value of values) {
+    if (value) set.add(value);
   }
   return [...set].sort((a, b) => a.localeCompare(b, 'zh-Hans-CN'));
 }
 
+interface EnumerableIndex {
+  categories: string[];
+  tags: string[];
+}
+
+/** 以数据集数组为键记忆化「分类 / 标签」枚举结果，避免每次请求重复全量遍历 + 排序。 */
+const enumerableCache = new WeakMap<Epigram[], EnumerableIndex>();
+
+function enumerableIndex(list: Epigram[]): EnumerableIndex {
+  const cached = enumerableCache.get(list);
+  if (cached !== undefined) return cached;
+
+  const index: EnumerableIndex = {
+    categories: collectUnique(list.map((e) => e.category)),
+    tags: collectUnique(list.flatMap((e) => e.tags ?? [])),
+  };
+  enumerableCache.set(list, index);
+  return index;
+}
+
+/** 收集去重后的分类（字典序）。 */
+export function collectCategories(list: Epigram[]): string[] {
+  return enumerableIndex(list).categories;
+}
+
 /** 收集去重后的标签（字典序）。 */
 export function collectTags(list: Epigram[]): string[] {
-  const set = new Set<string>();
-  for (const e of list) {
-    for (const t of e.tags ?? []) set.add(t);
-  }
-  return [...set].sort((a, b) => a.localeCompare(b, 'zh-Hans-CN'));
+  return enumerableIndex(list).tags;
+}
+
+/**
+ * 数据集指纹，用于派生接口的 ETag。
+ * 由 version + updated_at + 条数构成：任一变化都会产生新的 ETag，
+ * 客户端凭 If-None-Match 命中即可拿到 304，省去重复传输。
+ */
+export function datasetEtag(dataset: EpigramDataset): string {
+  return `W/"${dataset.version}-${dataset.updated_at}-${dataset.epigrams.length}"`;
 }

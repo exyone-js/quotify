@@ -1,3 +1,5 @@
+import { MAX_CSV_VALUES } from '../config';
+
 /** 业务错误：携带 HTTP 状态码，由顶层 onError 统一转成响应。 */
 export class ApiError extends Error {
   readonly status: number;
@@ -85,13 +87,19 @@ export function parseOffset(raw: string | undefined, name = 'offset'): number {
   return value;
 }
 
-/** 解析逗号分隔的多值参数，去空、去重；无有效值时返回 undefined。 */
-export function parseCsv(raw: string | undefined): string[] | undefined {
+/** 解析逗号分隔的多值参数：去空、去重；无有效值时返回 undefined。 */
+export function parseCsv(raw: string | undefined, name = 'filter'): string[] | undefined {
   if (!raw) return undefined;
   const values = raw
     .split(',')
     .map((item) => item.trim())
     .filter((item) => item.length > 0);
   if (values.length === 0) return undefined;
-  return [...new Set(values)];
+
+  const unique = [...new Set(values)];
+  // 限制取值个数：避免超长参数把过滤阶段的 includes 比较放大成 O(n·m)。
+  if (unique.length > MAX_CSV_VALUES) {
+    throw ApiError.badRequest(`参数 ${name} 最多支持 ${MAX_CSV_VALUES} 个取值。`);
+  }
+  return unique;
 }

@@ -1,5 +1,6 @@
-import { Hono } from 'hono';
+import { Hono, type Context } from 'hono';
 import {
+  CATALOG_CACHE_MAX_AGE,
   RANDOM_LIMIT_MAX,
   RANDOM_LIMIT_MIN,
   SEARCH_LIMIT_DEFAULT,
@@ -7,11 +8,20 @@ import {
   SEARCH_LIMIT_MIN,
 } from '../config';
 import { loadDatasetWithMeta } from '../data/loader';
-import { applyFilters, collectCategories, collectTags, paginate, randomPick, search } from '../data/store';
+import {
+  applyFilters,
+  collectCategories,
+  collectTags,
+  datasetEtag,
+  paginate,
+  randomPick,
+  search,
+} from '../data/store';
+import type { EpigramDataset } from '../data/types';
 import { publicRateLimit } from '../middleware/rateLimit';
 import type { Env } from '../types/env';
 import { ApiError, parseCsv, parseLimit, parseOffset } from '../utils/error';
-import { ok, plainText } from '../utils/response';
+import { cachedOk, notModified, ok, plainText } from '../utils/response';
 
 const quotes = new Hono<{ Bindings: Env }>();
 
@@ -24,10 +34,26 @@ function parseFormat(raw: string | undefined): 'json' | 'text' {
   throw ApiError.badRequest("参数 format 只支持 'json' 或 'text'。");
 }
 
+/**
+ * 分类 / 标签这类「同一数据集内结果稳定」的接口统一响应：
+ * 命中 `If-None-Match` 返回 304，否则返回带 ETag 与 Cache-Control 的 200。
+ */
+function respondCatalog(
+  c: Context<{ Bindings: Env }>,
+  dataset: EpigramDataset,
+  data: string[]
+): Response {
+  const etag = datasetEtag(dataset);
+  if (c.req.header('If-None-Match') === etag) {
+    return notModified(etag, CATALOG_CACHE_MAX_AGE);
+  }
+  return cachedOk(data, etag, CATALOG_CACHE_MAX_AGE);
+}
+
 /** GET /api/quotes —— 随机返回一条或多条。 */
 quotes.get('/', async (c) => {
-  const categories = parseCsv(c.req.query('category'));
-  const tags = parseCsv(c.req.query('tag'));
+  const categories = parseCsv(c.req.query('category'), 'category');
+  const tags = parseCsv(c.req.query('tag'), 'tag');
   const limit = parseLimit(c.req.query('limit'), 1, RANDOM_LIMIT_MIN, RANDOM_LIMIT_MAX);
   const format = parseFormat(c.req.query('format'));
 
@@ -51,8 +77,8 @@ quotes.get('/search', async (c) => {
     throw ApiError.badRequest('缺少必填参数 q（至少 1 个字符）。');
   }
 
-  const categories = parseCsv(c.req.query('category'));
-  const tags = parseCsv(c.req.query('tag'));
+  const categories = parseCsv(c.req.query('category'), 'category');
+  const tags = parseCsv(c.req.query('tag'), 'tag');
   const limit = parseLimit(
     c.req.query('limit'),
     SEARCH_LIMIT_DEFAULT,
@@ -70,13 +96,13 @@ quotes.get('/search', async (c) => {
 /** GET /api/quotes/categories —— 所有分类（去重、字典序）。 */
 quotes.get('/categories', async (c) => {
   const { dataset } = await loadDatasetWithMeta(c.env);
-  return ok(collectCategories(dataset.epigrams));
+  return respondCatalog(c, dataset, collectCategories(dataset.epigrams));
 });
 
 /** GET /api/quotes/tags —— 所有标签（去重、字典序）。 */
 quotes.get('/tags', async (c) => {
   const { dataset } = await loadDatasetWithMeta(c.env);
-  return ok(collectTags(dataset.epigrams));
+  return respondCatalog(c, dataset, collectTags(dataset.epigrams));
 });
 
 export default quotes;

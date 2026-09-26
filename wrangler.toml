@@ -6,15 +6,21 @@ compatibility_date = "2026-08-01"
 
 [vars]
 ENVIRONMENT = "production"
-# 数据源：指向 epigram-data 仓库中的 data.json（部署前把 <owner> 换成真实 GitHub 用户名）
+# 数据源：任意「公网可访问、且返回符合本项目数据格式的 JSON」的链接都可以。
+# 默认指向作者维护的 epigram-data 仓库；Fork 后请替换成你自己的仓库地址，
+# 否则你改不动数据（数据格式与校验规则见 README「数据仓库格式」）。
 DATA_URL = "https://raw.githubusercontent.com/exyone-js/epigram-data/main/data.json"
 DATA_TTL = "300"
+# 访问根域（`/`）时 302 跳转的目标（站内绝对路径），默认指向公开随机一言接口
+ROOT_REDIRECT = "/api/quotes/"
 # 本地开发默认值；生产环境请用 `wrangler secret put ADMIN_TOKEN` 覆盖
 ADMIN_TOKEN = "dev-secret-token"
 
 [[kv_namespaces]]
 binding = "CACHE"
-# TODO: 执行 `npx wrangler kv namespace create epigram-cache` 后填入真实 id
+# KV 命名空间：下面的 id 属于本项目作者，Fork 后你无权访问，必须换成自己的。
+# 创建命令：npx wrangler kv namespace create epigram-cache
+# 然后用输出结果里的 id 覆盖下一行（完整部署步骤见 README「部署」章节）。
 id = "b38989b10a4d4a119bd6bb8adc93e21b"
 
 [[ratelimits]]

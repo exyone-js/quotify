@@ -10,7 +10,7 @@
 - 缓存：Cloudflare KV（整份 `data.json` 作为一个值缓存，TTL 300 秒）
 - 限流：Cloudflare Rate Limiting Binding（公开 60 次/分钟/IP，管理 10 次/分钟/IP）
 - 测试：Vitest + `@cloudflare/vitest-pool-workers`（测试真实运行在 Workers 运行时中）
-- bundle：约 78 KiB（gzip 约 20 KiB），远低于 1 MB 上限
+- bundle：约 84 KiB（gzip 约 21 KiB），远低于 1 MB 上限
 
 ## 架构
 
@@ -19,39 +19,46 @@ GitHub 仓库 (epigram-data)
    │  data.json
    ▼
 Cloudflare Worker (epigram-api)
-   │  1. 查 KV 缓存 (epigram:data:v1)
-   │  2. 未命中 / 过期 → fetch raw.githubusercontent.com（5s 超时 + 边缘缓存）
-   │  3. 校验 JSON → 回写 KV (TTL 300s) + meta
+   │  1. 进程内热缓存（60s，避免每请求重复解析）—— 命中即返回
+   │  2. 查 KV 缓存 (epigram:data:v1)
+   │  3. 未命中 / 过期 → fetch raw.githubusercontent.com
+   │     （5s 超时 + 边缘缓存 60s；携带 If-None-Match，304 则复用旧数据并续期）
+   │  4. 校验 JSON → 回写 KV (TTL 300s) + meta（含上游 ETag）
    ▼
 Cloudflare KV (epigram-cache)
    ▼
 API 响应
 ```
 
+> 热缓存以 isolate 为单位，只用于省掉「读 KV + 全量解析」，不承担一致性保证；
+> 管理端 `/refresh` 会清掉当前 isolate 的副本。多 isolate 下数据最多陈旧一个热缓存 TTL（60s）。
+
 ## 目录结构
 
 ```text
 epigram/
 ├── src/
-│   ├── index.ts              # Worker 入口：CORS、健康检查、路由挂载、统一错误处理
+│   ├── index.ts              # Worker 入口：安全头、CORS、根域重定向、健康检查、路由挂载、统一错误处理
 │   ├── config.ts             # 常量、KV 键名、默认配置
 │   ├── routes/
 │   │   ├── quotes.ts         # 公开查询路由
 │   │   └── admin.ts          # 管理路由
 │   ├── data/
-│   │   ├── loader.ts         # KV / GitHub 懒加载 + 数据校验
-│   │   ├── store.ts          # 内存查询（filter / search / random / paginate）
+│   │   ├── loader.ts         # 热缓存 / KV / GitHub 懒加载 + 条件请求 + 数据校验
+│   │   ├── store.ts          # 内存查询（filter / search / random / paginate）+ 派生索引记忆化
 │   │   └── types.ts          # Epigram / EpigramDataset 类型
 │   ├── middleware/
+│   │   ├── security.ts       # 通用安全响应头
 │   │   ├── cors.ts           # CORS + OPTIONS 预检
-│   │   ├── auth.ts           # 管理接口 Bearer 鉴权
+│   │   ├── auth.ts           # 管理接口 Bearer 鉴权（恒定时间比较）
 │   │   └── rateLimit.ts      # 速率限制
 │   ├── utils/
-│   │   ├── response.ts       # 统一响应格式
+│   │   ├── response.ts       # 统一响应格式 + 缓存头 / 304
 │   │   └── error.ts          # 错误类型 + 参数校验
 │   └── types/
-│       └── env.ts            # Env 绑定类型
-├── tests/api.test.ts         # 集成测试
+│       └── env.ts            # 应用面向的 Env 绑定视图
+├── tests/api.test.ts         # 集成 / 单元测试
+├── .github/workflows/ci.yml  # CI：typecheck + test
 ├── data/data.json            # 示例数据集（推送到 epigram-data 仓库）
 ├── wrangler.toml
 ├── vitest.config.ts
@@ -68,28 +75,40 @@ epigram/
 ```
 
 状态码约定：`200` 成功 / `400` 参数错误 / `401` 未授权 / `404` 未找到 / `429` 限流 / `500` 服务器错误。
-所有响应都带 `Access-Control-Allow-Origin: *`。
+所有响应都带 `Access-Control-Allow-Origin: *`（含错误响应），以及安全头
+`X-Content-Type-Options: nosniff` 与 `Referrer-Policy: no-referrer`。
 路径末尾的斜杠会被忽略：`/api/quotes` 与 `/api/quotes/` 等价（Hono 以 `strict: false` 启动）。
+
+### `GET /` — 根域自动重定向
+
+直接访问根域（例如 `https://epigram-api.<your-subdomain>.workers.dev/`）会 **302** 跳转到
+`/api/quotes/`，避免用户看到裸 404。跳转只改写路径、**保留原始查询串**，
+因此 `/?limit=5&format=text` 等价于 `/api/quotes/?limit=5&format=text`。
+
+- 目标可通过环境变量 `ROOT_REDIRECT` 配置（默认 `/api/quotes/`）。
+- 出于安全考虑只接受站内绝对路径（以单个 `/` 开头），配置成外链等非法值会回退到默认值，避免开放重定向。
+- `HEAD /` 与 `GET /` 行为一致（Hono 会按 GET 处理并剥离响应体）。
 
 ### `GET /api/quotes` — 随机一言
 
 | 参数 | 类型 | 默认 | 说明 |
 |:---|:---|:---|:---|
-| `category` | string | 无 | 分类，多个用逗号分隔（OR） |
-| `tag` | string | 无 | 标签，多个用逗号分隔（OR） |
+| `category` | string | 无 | 分类，多个用逗号分隔（OR），最多 50 个 |
+| `tag` | string | 无 | 标签，多个用逗号分隔（OR），最多 50 个 |
 | `limit` | number | `1` | 返回数量，1–20（超出上限收敛到 20） |
 | `format` | string | `json` | `json` 或 `text` |
 
 `data` 始终为数组。`format=text` 时直接返回纯文本 `content`（多条以换行分隔），
 `Content-Type: text/plain; charset=utf-8`。
+`category` / `tag` 的取值个数超过 50 个时返回 `400`。
 
 ### `GET /api/quotes/search` — 关键词搜索
 
 | 参数 | 类型 | 默认 | 说明 |
 |:---|:---|:---|:---|
 | `q` | string | **必填** | 关键词，最少 1 个字符 |
-| `category` | string | 无 | 分类过滤 |
-| `tag` | string | 无 | 标签过滤 |
+| `category` | string | 无 | 分类过滤，最多 50 个 |
+| `tag` | string | 无 | 标签过滤，最多 50 个 |
 | `limit` | number | `10` | 1–50 |
 | `offset` | number | `0` | 偏移量，≥ 0 |
 
@@ -100,15 +119,18 @@ epigram/
 
 返回去重、按拼音排序的字符串数组。
 
+结果在同一数据集内稳定，因此响应带 `Cache-Control: public, max-age=3600` 与 `ETag`；
+客户端带 `If-None-Match` 再次请求时返回 **304**（无正文），并同样带 CORS 与安全头。
+
 ### `GET /api/health` — 健康检查
 
-只读缓存状态，不触发回源。
+只读缓存状态（优先命中热缓存，不触发回源）。
 
 ```json
 {
   "status": 200,
   "message": "ok.",
-  "data": { "service": "epigram", "cached": true, "cache_loaded_at": 1759000000000, "total": 1204 },
+  "data": { "service": "epigram", "environment": "production", "cached": true, "cache_loaded_at": 1759000000000, "total": 1204 },
   "ts": 1759000000123
 }
 ```
@@ -118,6 +140,9 @@ epigram/
 重新拉取 GitHub → 校验通过后覆盖 KV（`put` 会重置值与 TTL）。**不会**先删键：
 这样上游数据非法时缓存仍保留上一份合法数据，不会出现空缓存窗口。
 
+若带上一次记录的上游 `ETag` 请求，上游返回 **304** 时直接复用缓存数据并仅续期 KV，
+不重新下载与解析正文；此时 `total` 仍与当前数据集一致。
+
 ```json
 { "status": 200, "message": "ok.", "data": { "refreshed": true, "total": 1204, "loaded_at": 1759000000000, "source_url": "https://raw.githubusercontent.com/..." }, "ts": 1759000000123 }
 ```
@@ -126,7 +151,7 @@ epigram/
 
 返回 `{ total, categories, tags, version, updated_at, cached, cache_loaded_at }`。
 
-鉴权方式：请求头 `Authorization: Bearer <ADMIN_TOKEN>`。
+鉴权方式：请求头 `Authorization: Bearer <ADMIN_TOKEN>`，Token 采用恒定时间比较。
 
 ## 数据仓库格式
 
@@ -154,7 +179,7 @@ epigram/
 - `version` 必须是数字。
 - `epigrams` 必须是数组。
 - 每条记录必须含非空字符串 `id` 与 `content`。
-- `source` / `author` / `category` / `tags` 可选。
+- `source` / `author` / `category` 可选，若存在必须是字符串；`tags` 可选，若存在必须是字符串数组。
 - 非法数据直接返回 `500` 并记录日志，**不会**静默丢弃，也**不会**写入 KV。
 
 本仓库 `data/data.json` 是一份可直接推送的示例数据集（10 条）。
@@ -174,6 +199,7 @@ KV 键设计：
 |:---|:---|:---|:---|
 | `DATA_URL` | var | `https://raw.githubusercontent.com/<owner>/epigram-data/main/data.json` | 数据集地址 |
 | `DATA_TTL` | var | `300` | KV 缓存 TTL（秒） |
+| `ROOT_REDIRECT` | var | `/api/quotes/` | 根路径 302 重定向目标（仅接受站内绝对路径） |
 | `ENVIRONMENT` | var | `production` | 环境标识 |
 | `ADMIN_TOKEN` | **secret** | 本地开发默认 `dev-secret-token` | 管理接口 Token |
 | `CACHE` | KV binding | — | 缓存命名空间 |
@@ -230,6 +256,9 @@ npx wrangler deploy
 ```bash
 BASE=https://epigram-api.<your-subdomain>.workers.dev
 
+# 根域自动重定向（302 → /api/quotes/）
+curl -i "$BASE/"
+
 # 健康检查
 curl "$BASE/api/health"
 
@@ -276,11 +305,15 @@ curl -H "Authorization: Bearer $ADMIN_TOKEN" "$BASE/api/admin/stats"
 
 ## 生产验证清单
 
-1. `npm test` —— 17 个用例全部通过。
+1. `npm test` —— 37 个用例全部通过。
 2. `npm run typecheck` —— 无类型错误。
-3. `curl "$BASE/api/health"` —— `status=200` 且 `data.service="epigram"`。
-4. 首次 `curl "$BASE/api/quotes"` —— 返回数据且 KV 被写入；再次请求 `data.cached` 为 `true`。
-5. `curl -i -X OPTIONS "$BASE/api/quotes"` —— 返回 `Access-Control-Allow-Origin: *`。
-6. `curl -X POST "$BASE/api/admin/refresh"`（无 Token）—— 返回 `401`。
-7. `curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" "$BASE/api/admin/refresh"` —— 返回 `200` 且 `total` 与数据仓库条数一致。
-8. 把 `data.json` 中某条记录的 `content` 置空并提交 —— 管理刷新接口应返回 `500`，且 KV 中仍是上一份合法数据。
+3. `curl -i "$BASE/"` —— 返回 `302` 且 `Location` 指向 `/api/quotes/`。
+4. `curl "$BASE/api/health"` —— `status=200`、`data.service="epigram"` 且带 `data.environment`。
+5. 首次 `curl "$BASE/api/quotes"` —— 返回数据且 KV 被写入；再次请求 `data.cached` 为 `true`。
+6. `curl -i -X OPTIONS "$BASE/api/quotes"` —— 返回 `Access-Control-Allow-Origin: *`。
+7. `curl -i "$BASE/api/health"` —— 含 `X-Content-Type-Options: nosniff` 与 `Referrer-Policy: no-referrer`。
+8. `curl -i "$BASE/api/quotes/categories"` —— 含 `Cache-Control: public, max-age=3600` 与 `ETag`；
+   带上该 `ETag` 的 `If-None-Match` 再次请求 —— 返回 `304`。
+9. `curl -X POST "$BASE/api/admin/refresh"`（无 Token）—— 返回 `401`。
+10. `curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" "$BASE/api/admin/refresh"` —— 返回 `200` 且 `total` 与数据仓库条数一致。
+11. 把 `data.json` 中某条记录的 `content` 置空并提交 —— 管理刷新接口应返回 `500`，且 KV 中仍是上一份合法数据。

@@ -1,5 +1,12 @@
 import { env, SELF } from 'cloudflare:test';
+import { Hono } from 'hono';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { resolveRootRedirect } from '../src/config';
+import { invalidateMemoryCache } from '../src/data/loader';
+import { publicRateLimit } from '../src/middleware/rateLimit';
+import type { Env } from '../src/types/env';
+import { toErrorResponse } from '../src/utils/error';
+import { fail } from '../src/utils/response';
 
 interface Envelope<T> {
   status: number;
@@ -122,6 +129,8 @@ async function call<T>(path: string, init?: RequestInit): Promise<{ res: Respons
 
 beforeEach(async () => {
   upstreamCalls = 0;
+  // 进程内热缓存跨用例存活，必须显式清空，否则会掩盖真实的回源行为。
+  invalidateMemoryCache();
   await env.CACHE.delete(DATA_KEY);
   await env.CACHE.delete(META_KEY);
 
@@ -310,6 +319,40 @@ describe('POST /api/admin/refresh', () => {
   });
 });
 
+describe('根路径重定向', () => {
+  it('访问 / 返回 302 并指向 /api/quotes/', async () => {
+    const res = await SELF.fetch(`${BASE}/`, { redirect: 'manual' });
+
+    expect(res.status).toBe(302);
+    expect(res.headers.get('Location')).toBe(`${BASE}/api/quotes/`);
+    expect(res.headers.get('Access-Control-Allow-Origin')).toBe('*');
+  });
+
+  it('重定向保留原始查询串', async () => {
+    const res = await SELF.fetch(`${BASE}/?limit=3&format=text`, { redirect: 'manual' });
+
+    expect(res.status).toBe(302);
+    expect(res.headers.get('Location')).toBe(`${BASE}/api/quotes/?limit=3&format=text`);
+  });
+
+  it('跟随重定向即可拿到随机一言', async () => {
+    const res = await SELF.fetch(`${BASE}/`);
+
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as Envelope<Epigram[]>;
+    expect(Array.isArray(body.data)).toBe(true);
+    expect(body.data).toHaveLength(1);
+  });
+
+  it('HEAD / 同样重定向且无响应体', async () => {
+    const res = await SELF.fetch(`${BASE}/`, { method: 'HEAD', redirect: 'manual' });
+
+    expect(res.status).toBe(302);
+    expect(res.headers.get('Location')).toBe(`${BASE}/api/quotes/`);
+    expect(await res.text()).toBe('');
+  });
+});
+
 describe('CORS', () => {
   it('11. OPTIONS 预检返回 CORS 头', async () => {
     const res = await SELF.fetch(`${BASE}/api/quotes`, { method: 'OPTIONS' });
@@ -317,6 +360,13 @@ describe('CORS', () => {
     expect(res.headers.get('Access-Control-Allow-Origin')).toBe('*');
     expect(res.headers.get('Access-Control-Allow-Methods')).toContain('GET');
     expect(res.headers.get('Access-Control-Allow-Headers')).toContain('Authorization');
+  });
+
+  it('错误响应同样携带 CORS 头', async () => {
+    const res = await SELF.fetch(`${BASE}/api/quotes?limit=abc`);
+
+    expect(res.status).toBe(400);
+    expect(res.headers.get('Access-Control-Allow-Origin')).toBe('*');
   });
 });
 
@@ -358,5 +408,184 @@ describe('未匹配路由', () => {
     expect(res.status).toBe(404);
     expect(body.status).toBe(404);
     expect(body.data).toBeNull();
+  });
+});
+
+describe('安全与限流', () => {
+  it('响应携带安全响应头', async () => {
+    const res = await SELF.fetch(`${BASE}/api/health`);
+
+    expect(res.headers.get('X-Content-Type-Options')).toBe('nosniff');
+    expect(res.headers.get('Referrer-Policy')).toBe('no-referrer');
+  });
+
+  it('超过限流阈值返回 429，未超过则放行', async () => {
+    let used = 0;
+    const limiter = { limit: async () => ({ success: (used += 1) <= 2 }) };
+
+    const app = new Hono<{ Bindings: Env }>();
+    app.use('*', publicRateLimit());
+    app.get('/', (c) => c.text('ok'));
+    app.onError((err, _c) => {
+      const { status, message } = toErrorResponse(err);
+      return fail(status, message);
+    });
+
+    const appEnv = { PUBLIC_RATE_LIMITER: limiter } as unknown as Env;
+    const hit = () => app.request('/', {}, appEnv);
+
+    expect((await hit()).status).toBe(200);
+    expect((await hit()).status).toBe(200);
+    expect((await hit()).status).toBe(429);
+  });
+
+  it('缺少限流绑定时放行而不是报错', async () => {
+    const app = new Hono<{ Bindings: Env }>();
+    app.use('*', publicRateLimit());
+    app.get('/', (c) => c.text('ok'));
+
+    const res = await app.request('/', {}, {} as Env);
+    expect(res.status).toBe(200);
+  });
+
+  it('分类取值个数超过上限返回 400', async () => {
+    const many = Array.from({ length: 51 }, (_, i) => `c${i}`).join(',');
+    const { res } = await call<null>(`/api/quotes?category=${many}`);
+
+    expect(res.status).toBe(400);
+  });
+});
+
+describe('resolveRootRedirect', () => {
+  it('缺省返回默认目标', () => {
+    expect(resolveRootRedirect({} as Env)).toBe('/api/quotes/');
+  });
+
+  it('拒绝站外地址与协议相对地址，回退默认值', () => {
+    expect(resolveRootRedirect({ ROOT_REDIRECT: 'https://evil.com' } as Env)).toBe(
+      '/api/quotes/'
+    );
+    expect(resolveRootRedirect({ ROOT_REDIRECT: '//evil.com' } as Env)).toBe('/api/quotes/');
+    expect(resolveRootRedirect({ ROOT_REDIRECT: 'api/quotes' } as Env)).toBe('/api/quotes/');
+  });
+
+  it('接受站内绝对路径', () => {
+    expect(resolveRootRedirect({ ROOT_REDIRECT: '/custom/path' } as Env)).toBe('/custom/path');
+  });
+});
+
+describe('派生接口的 HTTP 缓存', () => {
+  it('返回 Cache-Control 与 ETag，命中 If-None-Match 时返回 304', async () => {
+    const first = await SELF.fetch(`${BASE}/api/quotes/categories`);
+    expect(first.status).toBe(200);
+    expect(first.headers.get('Cache-Control')).toContain('max-age=3600');
+
+    const etag = first.headers.get('ETag') ?? '';
+    expect(etag).not.toBe('');
+
+    const second = await SELF.fetch(`${BASE}/api/quotes/categories`, {
+      headers: { 'If-None-Match': etag },
+    });
+    expect(second.status).toBe(304);
+    expect(second.headers.get('ETag')).toBe(etag);
+    expect(second.headers.get('Access-Control-Allow-Origin')).toBe('*');
+  });
+});
+
+describe('健壮性', () => {
+  it('KV 缓存损坏时自动清理并回源恢复', async () => {
+    await env.CACHE.put(DATA_KEY, '{ 这不是合法 JSON', { expirationTtl: 300 });
+    await env.CACHE.put(META_KEY, '同样损坏', { expirationTtl: 300 });
+
+    const { res, body } = await call<Epigram[]>('/api/quotes');
+
+    expect(res.status).toBe(200);
+    expect(body.data).toHaveLength(1);
+
+    // 损坏值已被合法数据覆盖，元信息也被重写。
+    const repaired = await env.CACHE.get(DATA_KEY);
+    expect(repaired).toContain('"epigrams"');
+    expect(await env.CACHE.get(META_KEY)).toContain('source_url');
+  });
+
+  it('上游返回非 200 时返回 500', async () => {
+    vi.stubGlobal('fetch', async () => new Response('bad gateway', { status: 502 }));
+
+    const { res, body } = await call<null>('/api/quotes');
+
+    expect(res.status).toBe(500);
+    expect(body.status).toBe(500);
+  });
+
+  it('limit 超过上限时收敛，不会超出数据集总量', async () => {
+    const { res, body } = await call<Epigram[]>('/api/quotes?limit=999');
+
+    expect(res.status).toBe(200);
+    expect(body.data.length).toBe(DATASET.epigrams.length);
+  });
+
+  it('上游 304 时复用缓存并续期，不重新写入正文', async () => {
+    const etagValue = 'W/"dataset-v1"';
+    let sawConditional = false;
+
+    // 第一次：上游返回 200 + ETag，应完整写入 KV。
+    vi.stubGlobal('fetch', async () => {
+      upstreamCalls += 1;
+      return new Response(JSON.stringify(DATASET), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json', ETag: etagValue },
+      });
+    });
+
+    const first = await SELF.fetch(`${BASE}/api/quotes`);
+    expect(first.status).toBe(200);
+    expect(upstreamCalls).toBe(1);
+
+    // 第二次：仅当请求带上 If-None-Match 时返回 304，用于验证条件请求生效。
+    vi.stubGlobal('fetch', async (_input: unknown, init?: RequestInit) => {
+      if (new Headers(init?.headers).get('If-None-Match') === etagValue) {
+        sawConditional = true;
+        return new Response(null, { status: 304, headers: { ETag: etagValue } });
+      }
+      return new Response(JSON.stringify(DATASET), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json', ETag: etagValue },
+      });
+    });
+
+    const refreshed = await call<{ refreshed: boolean; total: number }>('/api/admin/refresh', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${ADMIN_TOKEN}` },
+    });
+
+    expect(sawConditional).toBe(true);
+    expect(refreshed.res.status).toBe(200);
+    expect(refreshed.body.data.total).toBe(DATASET.epigrams.length);
+  });
+
+  it('上游 304 但本地无缓存时返回 500 而不是死循环', async () => {
+    vi.stubGlobal('fetch', async () => new Response(null, { status: 304 }));
+
+    const { res } = await call<null>('/api/quotes');
+
+    expect(res.status).toBe(500);
+  });
+});
+
+describe('GET /api/admin/stats', () => {
+  it('携带正确 Token 时返回统计数据', async () => {
+    const { res, body } = await call<{
+      total: number;
+      categories: number;
+      tags: number;
+      version: number;
+      updated_at: string;
+    }>('/api/admin/stats', { headers: { Authorization: `Bearer ${ADMIN_TOKEN}` } });
+
+    expect(res.status).toBe(200);
+    expect(body.data.total).toBe(DATASET.epigrams.length);
+    expect(body.data.categories).toBe(3);
+    expect(body.data.version).toBe(1);
+    expect(body.data.updated_at).toBe(DATASET.updated_at);
   });
 });

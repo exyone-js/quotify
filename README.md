@@ -11,8 +11,8 @@
 - 运行时：Cloudflare Workers（V8 Isolates）
 - 语言：TypeScript（`strict: true`，禁用 `any`）
 - 框架：Hono
-- 数据源：`DATA_SOURCES` 配置的多个来源 + 可选的 `DATA_MANIFEST_URL` 清单（改文件即可动态增减，无需重新部署），
-  每个来源独立缓存、独立容错
+- 数据源：默认由 `DATA_MANIFEST_URL` 指向的**来源清单**提供（改清单文件即可动态增减来源，**无需重新部署**），
+  可另配 `DATA_SOURCES` 作静态兜底；每个来源独立缓存、独立容错
 - 缓存：Cloudflare KV（每个来源各缓存一份，TTL 300 秒）
 - 限流：Cloudflare Rate Limiting Binding（公开 60 次/分钟/IP，管理 10 次/分钟/IP）
 - 测试：Vitest + `@cloudflare/vitest-pool-workers`（测试真实运行在 Workers 运行时中）
@@ -21,7 +21,7 @@
 ## 架构
 
 ```text
-来源清单 sources.json（可选，DATA_MANIFEST_URL）
+来源清单 sources.json（默认，DATA_MANIFEST_URL）
    │  ["url", "url", ...]（与 DATA_SOURCES 同格式）
    ▼
 数据源 0..n（GitHub raw / 任意 HTTPS）
@@ -190,12 +190,26 @@ epigram/
 
 ## 数据仓库格式
 
-数据集通常放在独立仓库 **`epigram-data`** 的 `main` 分支根目录 `data.json`。
-可以配置**多个来源**（见「环境变量」的 `DATA_SOURCES`）——每个来源都使用下面这同一种格式，
-运行时会被合并成一个总池：随机抽取覆盖全部来源，搜索 / 分类 / 标签也跨来源聚合。
+数据集放在独立仓库 **`epigram-data`**：按 `category` 拆分到 `data/` 下的多个文件，
+根目录的 `sources.json`（**来源清单**）列出这些文件的地址。
 
-如果希望「改一个文件就能增减来源」，可以再放一份**来源清单**（同样是 JSON 字符串数组，
-元素为上面的 `data.json` 地址），用 `DATA_MANIFEST_URL` 指向它即可，详见「自建部署教程」第 9 步。
+本项目的默认配置就是这样——`DATA_SOURCES` 留空、`DATA_MANIFEST_URL` 指向该清单，
+所以**维护数据不需要重新部署 Worker**：新增一个分类只需在 `data/` 加文件并登记到 `sources.json`。
+
+```text
+epigram-data/
+├── sources.json          # 来源清单（列出下面全部数据文件）
+└── data/
+    ├── internet.json     # 网络
+    ├── literature.json   # 文学
+    ├── technology.json   # 科技
+    ├── philosophy.json   # 哲学
+    ├── film.json         # 影视
+    └── wisdom.json       # 哲理
+```
+
+每个数据文件都使用下面这同一种格式；运行时所有文件会被合并成一个总池，
+随机抽取覆盖全部文件，搜索 / 分类 / 标签也跨文件聚合：
 
 ```json
 {
@@ -239,8 +253,8 @@ KV 键设计：
 
 | 名称 | 类型 | 默认 | 说明 |
 |:---|:---|:---|:---|
-| `DATA_SOURCES` | var | 作者维护的 `epigram-data` 仓库 | 数据集来源列表（**JSON 字符串数组**，可多个；Fork 后请换成自己的，见「自建部署教程」） |
-| `DATA_MANIFEST_URL` | var | 空（不使用清单） | 可选的**来源清单**地址：JSON 字符串数组，与 `DATA_SOURCES` 合并。改清单文件即可动态增减来源，无需重新部署 |
+| `DATA_SOURCES` | var | `[]`（不配置静态来源） | 数据集来源列表（**JSON 字符串数组**）。默认留空——来源全部由清单提供；需要静态兜底（清单不可用时仍有内容）时在此列出 |
+| `DATA_MANIFEST_URL` | var | 作者的 `epigram-data/sources.json` | **来源清单**地址（JSON 字符串数组），与 `DATA_SOURCES` 合并去重（上限 20）。改清单即可动态增减来源、**无需重新部署**；显式留空则关闭清单 |
 | `DATA_TTL` | var | `300` | KV 缓存 TTL（秒） |
 | `ROOT_REDIRECT` | var | `/api/quotes/` | 根路径 302 重定向目标（仅接受站内绝对路径） |
 | `ENVIRONMENT` | var | `production` | 环境标识 |
@@ -293,32 +307,48 @@ npm run cf-typegen # 修改 wrangler.toml 后重新生成 worker-configuration.d
 
 ### 1. 准备你自己的数据集
 
-新建一个 GitHub 仓库（例如 `my-quotes-data`），在根目录放 `data.json`，
-格式见上文「数据仓库格式」——**根字段必须是 `quotes`**，每条记录至少要有非空的 `id` 与 `content`。
-可以直接复制本仓库的 [data/data.json](data/data.json) 当模板，把条目替换成你自己的。
+新建一个 GitHub 仓库（例如 `my-quotes-data`），在里面放数据集文件。
+**推荐按 `category` 拆分**到一个子目录（如 `data/`），一个分类一个文件，格式见上文「数据仓库格式」——
+**根字段必须是 `quotes`**，每条记录至少要有非空的 `id` 与 `content`。
 
-想用**多个来源**（例如「古诗词」「名人名言」各一个仓库）就重复这一步：
-每个来源都是一份格式相同的 `data.json`，运行时会被合并成一个总池。
+可以直接复制本仓库的 [data/data.json](data/data.json) 当**单文件**模板，
+或参考作者仓库 `epigram-data` 的**按分类拆分**结构。
 
 > `wrangler.toml` 中 `DATA_SOURCES` 的注释写着「任意公网可访问、且返回符合本项目数据格式的 JSON 的链接都可以」——
 > 也就是说数据集**不一定要放在 GitHub**，你自己的静态服务器 / 对象存储同样可行，只要 URL 公网可读。
 
-### 2. 把 `DATA_SOURCES` 指向你自己的数据集
+### 2. 把来源指向你自己的数据集
+
+**推荐：清单驱动（改文件即可，无需重新部署）**
+在数据仓库根目录放一份 `sources.json`，列出各个数据文件的地址，再把 `DATA_MANIFEST_URL` 指向它：
+
+```json
+["https://raw.githubusercontent.com/<你的用户名>/my-quotes-data/main/data/poetry.json",
+ "https://raw.githubusercontent.com/<你的用户名>/my-quotes-data/main/data/sayings.json"]
+```
 
 ```toml
 [vars]
-# 单个来源
-DATA_SOURCES = '["https://raw.githubusercontent.com/<你的用户名>/my-quotes-data/main/data.json"]'
-
-# 多个来源：顺序即优先级（仅影响超出上限时保留哪些），KV 缓存按来源 URL 独立存放
-DATA_SOURCES = '["https://raw.githubusercontent.com/<你的用户名>/poems/main/data.json", "https://raw.githubusercontent.com/<你的用户名>/sayings/main/data.json"]'
+DATA_SOURCES = '[]'   # 留空：不配置静态来源，来源全部来自清单
+DATA_MANIFEST_URL = "https://raw.githubusercontent.com/<你的用户名>/my-quotes-data/main/sources.json"
 ```
 
-> 对应注释：「默认指向作者维护的 epigram-data 仓库；Fork 后请替换成你自己的仓库地址，**否则你改不动数据**」。
-> 保持默认值时，你的实例会一直读取作者的数据集，自己改数据不会有任何效果。
+**备选：静态来源（更直接，但改一次就要重新部署）**
+把地址写进 `DATA_SOURCES`，并显式关闭清单：
+
+```toml
+[vars]
+DATA_SOURCES = '["https://raw.githubusercontent.com/<你的用户名>/my-quotes-data/main/data/poetry.json"]'
+DATA_MANIFEST_URL = ""
+```
+
+两种方式可以混用：`DATA_SOURCES` 与清单里的来源会**合并去重**（上限 20 个）。
+
+> 对应注释：「Fork 后请换成你自己的仓库地址，**否则你改不动数据**」。保持默认值时，
+> 你的实例会一直读取作者的数据集，自己改数据不会有任何效果。
 >
-> ⚠️ `DATA_SOURCES` 必须是**合法的 JSON 字符串数组**；写错（例如不是数组、不是合法 JSON）时接口会直接报 `500`
-> 并给出提示，而不会静默回退到默认来源——避免「配置写错了却毫无察觉」。
+> ⚠️ `DATA_SOURCES` 必须是**合法的 JSON 字符串数组**；写错（不是数组 / 不是合法 JSON）时接口直接报 `500`
+> 并给出提示，不会静默回退——避免「配置写错了却毫无察觉」。`DATA_MANIFEST_URL` 显式留空则关闭清单。
 
 ### 3. 创建你自己的 KV 命名空间
 
@@ -385,33 +415,12 @@ curl -X POST -H "Authorization: Bearer <你的 ADMIN_TOKEN>" "$BASE/api/admin/re
 
 完整验收项见文末「生产验证清单」。
 
-### 8. 以后如何更新数据集
+### 8. 日常维护
 
-只需修改你数据仓库里的 `data.json` 并提交。Worker 会在 KV 过期（`DATA_TTL`，默认 300 秒）后
-自动拉到新数据；想立即生效，调一次 `POST /api/admin/refresh`。
-
-### 9.（可选）用清单文件动态增减来源
-
-第 2 步的 `DATA_SOURCES` 是**部署期配置**——每改一次都要重新部署。如果想让「改一个文件就能增减来源」，
-可以再准备一份**来源清单**：
-
-1. 建一个内容是 JSON 字符串数组的文件（例如数据仓库里的 `sources.json`），格式与 `DATA_SOURCES` 完全一致：
-
-   ```json
-   [
-     "https://raw.githubusercontent.com/<你的用户名>/poems/main/data.json",
-     "https://raw.githubusercontent.com/<你的用户名>/sayings/main/data.json"
-   ]
-   ```
-
-2. 把它的地址填到 `DATA_MANIFEST_URL`：
-
-   ```toml
-   DATA_MANIFEST_URL = "https://raw.githubusercontent.com/<你的用户名>/my-quotes-data/main/sources.json"
-   ```
-
-之后增减来源只需改 `sources.json` 并提交，最多等 `DATA_TTL`（默认 300 秒）自动生效，
-或立刻调一次 `POST /api/admin/refresh`，**全程不用重新部署 Worker**。
+- **改引语内容**：编辑数据文件并提交，等 `DATA_TTL`（默认 300 秒）自动生效，或调一次 `POST /api/admin/refresh` 立即生效。
+- **新增分类 / 数据文件**：在数据仓库新建 `<slug>.json`，把地址追加到 `sources.json`，提交即可——**不需要重新部署 Worker**。
+- **新增来源仓库**：同上，把新仓库的数据文件地址登记进清单。
+- **排查来源问题**：`GET /api/admin/stats` 的 `sources` / `failures` / `manifest` 会显示每个来源的状态与清单解析结果。
 
 > 清单里的来源会与 `DATA_SOURCES` **合并**（去重后最多 20 个，超出部分丢弃并告警）。
 > 清单不可用或内容格式非法时**不会影响服务**：自动降级为「只用 `DATA_SOURCES`」或「沿用上一份合法清单」，

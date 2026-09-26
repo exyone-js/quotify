@@ -6,6 +6,7 @@ import {
   manifestKey,
   metaKey,
   resolveBaselineSources,
+  resolveManifestUrl,
   resolveRootRedirect,
 } from '../src/config';
 import {
@@ -34,7 +35,7 @@ interface Quote {
   tags?: string[];
 }
 
-/** 固定的 mock 数据集：mock 掉 raw.githubusercontent.com 的返回。 */
+/** 固定的 mock 数据集：默认上游桩通过 SOURCE_URL 返回它。 */
 const DATASET = {
   version: 1,
   updated_at: '2026-09-26T12:00:00Z',
@@ -138,17 +139,19 @@ const DATASET_B = {
   ],
 };
 
-/** 部署配置里的默认来源（来自 wrangler.toml 的 DATA_SOURCES）。 */
-const SOURCE_URL = resolveBaselineSources(env as unknown as Env)[0];
-/** 多来源 / 清单用例使用的额外来源。 */
+/** 默认来源清单（由 wrangler.toml 的 DATA_MANIFEST_URL 提供，测试环境必定存在）。 */
+const DEFAULT_MANIFEST = resolveManifestUrl(env as unknown as Env) as string;
+/** 默认清单里列出的数据集地址（测试桩按此地址返回 DATASET）。 */
+const SOURCE_URL = 'https://raw.githubusercontent.com/exyone-js/epigram-data/main/data/literature.json';
+/** 多来源 / 自定义清单用例使用的地址。 */
 const SOURCE_A = 'https://example.test/a.json';
 const SOURCE_B = 'https://example.test/b.json';
-const MANIFEST_URL = 'https://example.test/sources.json';
+const CUSTOM_MANIFEST_URL = 'https://example.test/sources.json';
 
 // KV 键由来源 URL 派生（而不是数组下标），这里用同一套函数计算，避免测试与实现脱节。
 const DATA_KEY = dataKey(SOURCE_URL);
 const META_KEY = metaKey(SOURCE_URL);
-/** 所有用例可能用到的 KV 键，beforeEach 统一清空。 */
+/** 所有用例可能用到的 KV 键（含清单缓存），beforeEach 统一清空。 */
 const CACHE_KEYS = [
   dataKey(SOURCE_URL),
   metaKey(SOURCE_URL),
@@ -156,7 +159,8 @@ const CACHE_KEYS = [
   metaKey(SOURCE_A),
   dataKey(SOURCE_B),
   metaKey(SOURCE_B),
-  manifestKey(MANIFEST_URL),
+  manifestKey(DEFAULT_MANIFEST),
+  manifestKey(CUSTOM_MANIFEST_URL),
 ];
 const BASE = 'https://epigram.test';
 const ADMIN_TOKEN = 'dev-secret-token';
@@ -184,23 +188,29 @@ function jsonResponse(body: unknown): Response {
   });
 }
 
+/**
+ * 默认上游桩：清单地址返回 `[SOURCE_URL]`，SOURCE_URL 返回 DATASET。
+ * 其它地址直接抛错，以便发现漏桩（默认配置已是「来源由清单提供」）。
+ */
+function stubDefaultUpstream(): void {
+  vi.stubGlobal('fetch', async (input: unknown) => {
+    const url = urlOf(input);
+    if (url === DEFAULT_MANIFEST) return jsonResponse([SOURCE_URL]);
+    if (url === SOURCE_URL) {
+      upstreamCalls += 1;
+      return jsonResponse(DATASET);
+    }
+    throw new Error(`unexpected fetch: ${url}`);
+  });
+}
+
 beforeEach(async () => {
   upstreamCalls = 0;
   // 进程内热缓存跨用例存活，必须显式清空，否则会掩盖真实的回源行为。
   invalidateMemoryCache();
   await Promise.all(CACHE_KEYS.map((key) => env.CACHE.delete(key)));
 
-  vi.stubGlobal('fetch', async (input: unknown) => {
-    const url = input instanceof Request ? input.url : String(input);
-    if (url.includes('raw.githubusercontent.com')) {
-      upstreamCalls += 1;
-      return new Response(JSON.stringify(DATASET), {
-        status: 200,
-        headers: { 'Content-Type': 'application/json' },
-      });
-    }
-    throw new Error(`unexpected fetch: ${url}`);
-  });
+  stubDefaultUpstream();
 });
 
 afterEach(() => {
@@ -221,9 +231,21 @@ describe('GET /api/health', () => {
     expect(body.status).toBe(200);
     expect(body.data.service).toBe('epigram');
     expect(typeof body.data.total).toBe('number');
-    // 单来源配置：总数为 1，未预热时 loaded 为 0
-    expect(body.data.sources.total).toBe(1);
-    expect(body.data.sources.loaded).toBe(0);
+    // 冷启动：清单尚未缓存，无法枚举来源 → 0/0（健康检查不回源，这是预期行为）
+    expect(body.data.cached).toBe(false);
+    expect(body.data.sources).toEqual({ loaded: 0, total: 0 });
+
+    // 预热之后：来源与内容都已在缓存中
+    await call<Quote[]>('/api/quotes');
+    const warm = await call<{
+      cached: boolean;
+      total: number;
+      sources: { loaded: number; total: number };
+    }>('/api/health');
+
+    expect(warm.body.data.cached).toBe(true);
+    expect(warm.body.data.sources).toEqual({ loaded: 1, total: 1 });
+    expect(warm.body.data.total).toBe(DATASET.quotes.length);
   });
 });
 
@@ -367,9 +389,11 @@ describe('POST /api/admin/refresh', () => {
     const before = await env.CACHE.get(DATA_KEY);
     expect(before).not.toBeNull();
 
-    vi.stubGlobal('fetch', async () =>
-      new Response(JSON.stringify({ version: 1, quotes: [{ id: 'broken' }] }), { status: 200 })
-    );
+    vi.stubGlobal('fetch', async (input: unknown) => {
+      // 清单正常，只有数据集内容非法
+      if (urlOf(input) === DEFAULT_MANIFEST) return jsonResponse([SOURCE_URL]);
+      return jsonResponse({ version: 1, quotes: [{ id: 'broken' }] });
+    });
 
     const { res } = await call<null>('/api/admin/refresh', {
       method: 'POST',
@@ -571,7 +595,11 @@ describe('健壮性', () => {
   });
 
   it('上游返回非 200 时返回 500', async () => {
-    vi.stubGlobal('fetch', async () => new Response('bad gateway', { status: 502 }));
+    vi.stubGlobal('fetch', async (input: unknown) => {
+      // 清单正常，只有数据集回源失败
+      if (urlOf(input) === DEFAULT_MANIFEST) return jsonResponse([SOURCE_URL]);
+      return new Response('bad gateway', { status: 502 });
+    });
 
     const { res, body } = await call<null>('/api/quotes');
 
@@ -591,12 +619,16 @@ describe('健壮性', () => {
     let sawConditional = false;
 
     // 第一次：上游返回 200 + ETag，应完整写入 KV。
-    vi.stubGlobal('fetch', async () => {
-      upstreamCalls += 1;
-      return new Response(JSON.stringify(DATASET), {
+    const okWithEtag = (): Response =>
+      new Response(JSON.stringify(DATASET), {
         status: 200,
         headers: { 'Content-Type': 'application/json', ETag: etagValue },
       });
+
+    vi.stubGlobal('fetch', async (input: unknown) => {
+      if (urlOf(input) === DEFAULT_MANIFEST) return jsonResponse([SOURCE_URL]);
+      upstreamCalls += 1;
+      return okWithEtag();
     });
 
     const first = await SELF.fetch(`${BASE}/api/quotes`);
@@ -604,15 +636,13 @@ describe('健壮性', () => {
     expect(upstreamCalls).toBe(1);
 
     // 第二次：仅当请求带上 If-None-Match 时返回 304，用于验证条件请求生效。
-    vi.stubGlobal('fetch', async (_input: unknown, init?: RequestInit) => {
+    vi.stubGlobal('fetch', async (input: unknown, init?: RequestInit) => {
+      if (urlOf(input) === DEFAULT_MANIFEST) return jsonResponse([SOURCE_URL]);
       if (new Headers(init?.headers).get('If-None-Match') === etagValue) {
         sawConditional = true;
         return new Response(null, { status: 304, headers: { ETag: etagValue } });
       }
-      return new Response(JSON.stringify(DATASET), {
-        status: 200,
-        headers: { 'Content-Type': 'application/json', ETag: etagValue },
-      });
+      return okWithEtag();
     });
 
     const refreshed = await call<{ refreshed: boolean; total: number }>('/api/admin/refresh', {
@@ -626,7 +656,10 @@ describe('健壮性', () => {
   });
 
   it('上游 304 但本地无缓存时返回 500 而不是死循环', async () => {
-    vi.stubGlobal('fetch', async () => new Response(null, { status: 304 }));
+    vi.stubGlobal('fetch', async (input: unknown) => {
+      if (urlOf(input) === DEFAULT_MANIFEST) return jsonResponse([SOURCE_URL]);
+      return new Response(null, { status: 304 });
+    });
 
     const { res } = await call<null>('/api/quotes');
 
@@ -652,10 +685,10 @@ describe('GET /api/admin/stats', () => {
     expect(body.data.categories).toBe(3);
     expect(body.data.version).toBe(1);
     expect(body.data.updated_at).toBe(DATASET.updated_at);
-    // 单来源场景下，明细里应恰好有一个来源且无失败项；未配置清单时 manifest 为 null
+    // 默认配置：来源由默认清单提供（1 个），无失败项
     expect(body.data.sources).toHaveLength(1);
     expect(body.data.failures).toHaveLength(0);
-    expect(body.data.manifest).toBeNull();
+    expect(body.data.manifest).toEqual({ url: DEFAULT_MANIFEST, count: 1, error: null });
   });
 });
 
@@ -802,7 +835,7 @@ describe('来源清单（动态来源）', () => {
   function stubWithManifest(manifestResponse: () => Response): void {
     vi.stubGlobal('fetch', async (input: unknown) => {
       const url = urlOf(input);
-      if (url === MANIFEST_URL) return manifestResponse();
+      if (url === CUSTOM_MANIFEST_URL) return manifestResponse();
       if (url === SOURCE_B) return jsonResponse(DATASET_B);
       return jsonResponse(DATASET);
     });
@@ -811,15 +844,15 @@ describe('来源清单（动态来源）', () => {
   it('清单里的来源会与 DATA_SOURCES 合并', async () => {
     stubWithManifest(() => jsonResponse([SOURCE_B]));
 
-    const result = await loadDatasetWithMeta(sourceEnv([SOURCE_A], MANIFEST_URL));
+    const result = await loadDatasetWithMeta(sourceEnv([SOURCE_A], CUSTOM_MANIFEST_URL));
 
-    expect(result.manifest).toEqual({ url: MANIFEST_URL, count: 1, error: null });
+    expect(result.manifest).toEqual({ url: CUSTOM_MANIFEST_URL, count: 1, error: null });
     expect(result.sources).toHaveLength(2);
     expect(result.dataset.quotes).toHaveLength(DATASET.quotes.length + 1);
-    expect(await env.CACHE.get(manifestKey(MANIFEST_URL))).not.toBeNull();
+    expect(await env.CACHE.get(manifestKey(CUSTOM_MANIFEST_URL))).not.toBeNull();
   });
 
-  it('未配置清单时 manifest 为 null', async () => {
+  it('清单显式留空时关闭清单（manifest 为 null）', async () => {
     vi.stubGlobal('fetch', async () => jsonResponse(DATASET));
 
     const result = await loadDatasetWithMeta(sourceEnv([SOURCE_A], ''));
@@ -830,7 +863,7 @@ describe('来源清单（动态来源）', () => {
   it('清单不可用时降级为仅用 DATA_SOURCES，并记录错误', async () => {
     stubWithManifest(() => new Response('boom', { status: 500 }));
 
-    const result = await loadDatasetWithMeta(sourceEnv([SOURCE_A], MANIFEST_URL));
+    const result = await loadDatasetWithMeta(sourceEnv([SOURCE_A], CUSTOM_MANIFEST_URL));
 
     expect(result.manifest?.error).toBeTruthy();
     expect(result.manifest?.count).toBe(0);
@@ -839,7 +872,7 @@ describe('来源清单（动态来源）', () => {
   });
 
   it('清单内容非法时沿用上一份合法清单，且不覆盖缓存', async () => {
-    const scoped = sourceEnv([SOURCE_A], MANIFEST_URL);
+    const scoped = sourceEnv([SOURCE_A], CUSTOM_MANIFEST_URL);
     stubWithManifest(() => jsonResponse([SOURCE_B]));
     await loadDatasetWithMeta(scoped);
 
@@ -851,5 +884,41 @@ describe('来源清单（动态来源）', () => {
     expect(result.manifest?.error).toContain('格式非法');
     expect(result.manifest?.count).toBe(1); // 沿用上一份合法清单
     expect(result.dataset.quotes).toHaveLength(DATASET.quotes.length + 1);
+  });
+
+  it('既没有静态来源也没有清单时给出明确错误', async () => {
+    const bare = {
+      CACHE: env.CACHE,
+      DATA_SOURCES: '[]',
+      DATA_MANIFEST_URL: '',
+    } as unknown as Env;
+
+    await expect(loadDatasetWithMeta(bare)).rejects.toThrow(/未解析到任何数据来源/);
+  });
+});
+
+describe('来源配置解析', () => {
+  it('未配置或显式空数组的 DATA_SOURCES 都不设静态来源（交给清单）', () => {
+    expect(resolveBaselineSources({} as Env)).toEqual([]);
+    expect(resolveBaselineSources({ DATA_SOURCES: '[]' } as Env)).toEqual([]);
+  });
+
+  it('DATA_SOURCES 按序解析并去重', () => {
+    expect(resolveBaselineSources({ DATA_SOURCES: '["a", "b", "a"]' } as Env)).toEqual(['a', 'b']);
+  });
+
+  it('未配置 DATA_MANIFEST_URL 时回退到默认清单地址', () => {
+    expect(resolveManifestUrl({} as Env)).toBe(DEFAULT_MANIFEST);
+  });
+
+  it('显式留空 DATA_MANIFEST_URL 时关闭清单', () => {
+    expect(resolveManifestUrl({ DATA_MANIFEST_URL: '' } as Env)).toBeNull();
+    expect(resolveManifestUrl({ DATA_MANIFEST_URL: '   ' } as Env)).toBeNull();
+  });
+
+  it('自定义 DATA_MANIFEST_URL 时优先使用它（并去掉首尾空白）', () => {
+    expect(resolveManifestUrl({ DATA_MANIFEST_URL: ' https://x/y.json ' } as Env)).toBe(
+      'https://x/y.json'
+    );
   });
 });

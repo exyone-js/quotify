@@ -44,10 +44,20 @@ export function manifestKey(url: string): string {
   return `${MANIFEST_KEY_PREFIX}:${fingerprint(url)}`;
 }
 
-/** 默认数据集来源；与 `wrangler.toml` 的 `DATA_SOURCES` 保持一致。 */
-export const DEFAULT_DATA_SOURCES: readonly string[] = [
-  'https://raw.githubusercontent.com/exyone-js/epigram-data/main/data.json',
-];
+/**
+ * 默认「来源清单」地址：epigram-data 仓库根目录的 `sources.json`
+ * （一个 JSON 字符串数组，每项是一个数据集文件地址）。
+ *
+ * 未显式配置 `DATA_MANIFEST_URL` 时使用它；显式配置为空字符串则表示关闭清单。
+ */
+export const DEFAULT_MANIFEST_URL =
+  'https://raw.githubusercontent.com/exyone-js/epigram-data/main/sources.json';
+
+/**
+ * 默认静态来源：留空表示「默认不配置静态来源」，来源列表完全由清单文件解析得到。
+ * 需要静态兜底（清单不可用时仍有内容可服务）时，在 `wrangler.toml` 的 `DATA_SOURCES` 里列出。
+ */
+export const DEFAULT_DATA_SOURCES: readonly string[] = [];
 
 /** 缓存默认 TTL：300 秒。 */
 export const DEFAULT_DATA_TTL = 300;
@@ -113,20 +123,28 @@ export function parseSourceList(raw: string, label: string): string[] {
  * 读取基线来源（部署期配置的 `DATA_SOURCES`）。
  *
  * 这是「配置」而非「运行期数据」，所以非法时**直接抛错**而不是静默回退，
- * 避免「配置写错了却毫无察觉」；为空时才回退到默认来源。
+ * 避免「配置写错了却毫无察觉」。未配置或显式 `[]` 都表示不设静态来源
+ * （此时来源全部来自清单文件，见 `resolveManifestUrl`）。
  */
 export function resolveBaselineSources(env: Env): string[] {
   const raw = env.DATA_SOURCES?.trim();
   if (!raw) return [...DEFAULT_DATA_SOURCES];
 
-  const urls = parseSourceList(raw, 'DATA_SOURCES');
-  return urls.length > 0 ? urls : [...DEFAULT_DATA_SOURCES];
+  return parseSourceList(raw, 'DATA_SOURCES');
 }
 
-/** 读取可选的来源清单文件地址；未配置时返回 null。 */
+/**
+ * 读取来源清单地址：清单里解析出的来源会与基线来源合并。
+ *
+ * - 未配置（`undefined`）→ 使用 `DEFAULT_MANIFEST_URL`；
+ * - 显式留空字符串 → 关闭清单，只用 `DATA_SOURCES`。
+ */
 export function resolveManifestUrl(env: Env): string | null {
-  const url = env.DATA_MANIFEST_URL?.trim();
-  return url && url.length > 0 ? url : null;
+  const raw = env.DATA_MANIFEST_URL;
+  if (raw === undefined) return DEFAULT_MANIFEST_URL;
+
+  const url = raw.trim();
+  return url.length > 0 ? url : null;
 }
 
 /** 合并来源并截断到上限；超出部分丢弃并告警（保留靠前的来源，顺序即优先级）。 */

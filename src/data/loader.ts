@@ -527,6 +527,10 @@ async function loadAggregate(env: Env, baseline: string[], force: boolean): Prom
   const manifest = await loadManifest(env, force);
   const urls = limitSources([...baseline, ...(manifest?.urls ?? [])]);
 
+  if (urls.length === 0) {
+    throw new UpstreamError('未解析到任何数据来源：请检查 DATA_SOURCES 与 DATA_MANIFEST_URL 配置。');
+  }
+
   const outcomes = await Promise.all(
     urls.map(async (url): Promise<SourceOutcome> => {
       try {

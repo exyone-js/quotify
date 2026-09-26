@@ -4,29 +4,32 @@
 > 功能定位参考一言（随机返回一条或多条引语），但接口约定自成一套，**并非** Hitokoto 的兼容实现。
 
 运行在 **Cloudflare Workers** 上的生产级引语 API：随机返回引语，并支持分类 / 标签筛选与关键词搜索。
-数据源不是数据库，而是 **GitHub 仓库中的 `data.json`**；运行时通过 **Cloudflare KV 懒加载缓存**，
-所有筛选 / 搜索 / 随机操作在 Worker 内存中完成。不使用 D1，不使用任何 Node.js 专有 API。
+数据源不是数据库，而是 **一个或多个 `data.json`**（可配置多个不同来源，随机抽取时合并成一个总池）；
+运行时通过 **Cloudflare KV 懒加载缓存**，所有筛选 / 搜索 / 随机操作在 Worker 内存中完成。
+不使用 D1，不使用任何 Node.js 专有 API。
 
 - 运行时：Cloudflare Workers（V8 Isolates）
 - 语言：TypeScript（`strict: true`，禁用 `any`）
 - 框架：Hono
-- 缓存：Cloudflare KV（整份 `data.json` 作为一个值缓存，TTL 300 秒）
+- 数据源：`DATA_SOURCES` 配置的多个来源，每个来源独立缓存、独立容错
+- 缓存：Cloudflare KV（每个来源各缓存一份，TTL 300 秒）
 - 限流：Cloudflare Rate Limiting Binding（公开 60 次/分钟/IP，管理 10 次/分钟/IP）
 - 测试：Vitest + `@cloudflare/vitest-pool-workers`（测试真实运行在 Workers 运行时中）
-- bundle：约 84 KiB（gzip 约 21 KiB），远低于 1 MB 上限
+- bundle：约 88 KiB（gzip 约 22 KiB），远低于 1 MB 上限
 
 ## 架构
 
 ```text
-GitHub 仓库 (epigram-data)
-   │  data.json
+数据源 0..n（GitHub raw / 任意 HTTPS）
+   │  data.json × n（每个来源格式相同）
    ▼
 Cloudflare Worker (epigram-api)
    │  1. 进程内热缓存（60s，避免每请求重复解析）—— 命中即返回
-   │  2. 查 KV 缓存 (epigram:data:v2)
-   │  3. 未命中 / 过期 → fetch raw.githubusercontent.com
+   │  2. 并发查各来源的 KV 缓存 (epigram:data:v1:<来源序号>)
+   │  3. 未命中 / 过期 → 并发回源
    │     （5s 超时 + 边缘缓存 60s；携带 If-None-Match，304 则复用旧数据并续期）
-   │  4. 校验 JSON → 回写 KV (TTL 300s) + meta（含上游 ETag）
+   │  4. 校验 JSON → 各来源回写自己的 KV (TTL 300s) + meta（含上游 ETag）
+   │  5. 合并所有可用来源为一个总池（单个来源失败只跳过它，不拖垮整体）
    ▼
 Cloudflare KV (epigram-cache)
    ▼
@@ -47,7 +50,7 @@ epigram/
 │   │   ├── quotes.ts         # 公开查询路由
 │   │   └── admin.ts          # 管理路由
 │   ├── data/
-│   │   ├── loader.ts         # 热缓存 / KV / GitHub 懒加载 + 条件请求 + 数据校验
+│   │   ├── loader.ts         # 多来源懒加载 / 合并 + 各来源独立 KV 与条件请求 + 数据校验
 │   │   ├── store.ts          # 内存查询（filter / search / random / paginate）+ 派生索引记忆化
 │   │   └── types.ts          # Quote / QuoteDataset 类型
 │   ├── middleware/
@@ -147,38 +150,43 @@ epigram/
 
 ### `GET /api/health` — 健康检查
 
-只读缓存状态（优先命中热缓存，不触发回源）。
+只读缓存状态（优先命中热缓存，不触发回源）。`data.sources` 表示「已缓存来源数 / 配置来源总数」。
 
 ```json
 {
   "status": 200,
   "message": "ok.",
-  "data": { "service": "epigram", "environment": "production", "cached": true, "cache_loaded_at": 1759000000000, "total": 1204 },
+  "data": { "service": "epigram", "environment": "production", "cached": true, "cache_loaded_at": 1759000000000, "total": 1204, "sources": { "loaded": 2, "total": 2 } },
   "ts": 1759000000123
 }
 ```
 
 ### `POST /api/admin/refresh` — 强制刷新缓存（需鉴权）
 
-重新拉取 GitHub → 校验通过后覆盖 KV（`put` 会重置值与 TTL）。**不会**先删键：
-这样上游数据非法时缓存仍保留上一份合法数据，不会出现空缓存窗口。
+对**每个来源**分别「重新拉取 → 校验通过后覆盖自己的 KV」（`put` 会重置值与 TTL）。**不会**先删键：
+这样上游数据非法时该来源的缓存仍保留上一份合法数据，不会出现空缓存窗口。
+
+单个来源失败不影响其它来源：其结果记录在 `failures` 里，服务照常使用其余来源；只有**全部来源都失败**才返回 `500`。
 
 若带上一次记录的上游 `ETag` 请求，上游返回 **304** 时直接复用缓存数据并仅续期 KV，
 不重新下载与解析正文；此时 `total` 仍与当前数据集一致。
 
 ```json
-{ "status": 200, "message": "ok.", "data": { "refreshed": true, "total": 1204, "loaded_at": 1759000000000, "source_url": "https://raw.githubusercontent.com/..." }, "ts": 1759000000123 }
+{ "status": 200, "message": "ok.", "data": { "refreshed": true, "total": 1204, "loaded_at": 1759000000000, "sources": [{ "index": 0, "url": "https://.../a.json", "total": 600, "loaded_at": 1759000000000, "cached": false }], "failures": [] }, "ts": 1759000000123 }
 ```
 
 ### `GET /api/admin/stats` — 数据统计（需鉴权）
 
-返回 `{ total, categories, tags, version, updated_at, cached, cache_loaded_at }`。
+返回 `{ total, categories, tags, version, updated_at, cached, cache_loaded_at, sources, failures }`。
+其中 `version` / `updated_at` 是各来源的**聚合值**（取较大者），按来源的明细在 `sources` 与 `failures` 中。
 
 鉴权方式：请求头 `Authorization: Bearer <ADMIN_TOKEN>`，Token 采用恒定时间比较。
 
 ## 数据仓库格式
 
-数据集放在独立仓库 **`epigram-data`** 的 `main` 分支根目录 `data.json`：
+数据集通常放在独立仓库 **`epigram-data`** 的 `main` 分支根目录 `data.json`。
+可以配置**多个来源**（见「环境变量」的 `DATA_SOURCES`）——每个来源都使用下面这同一种格式，
+运行时会被合并成一个总池：随机抽取覆盖全部来源，搜索 / 分类 / 标签也跨来源聚合。
 
 ```json
 {
@@ -211,16 +219,14 @@ KV 键设计：
 
 | 键 | 值 | 说明 |
 |:---|:---|:---|
-| `epigram:data:v2` | JSON 字符串 | 完整数据集 |
-| `epigram:meta:v2` | JSON 字符串 | `{ loaded_at, source_url, etag? }`（`etag` 为上游 ETag，用于条件请求） |
-
-数据结构升级时把版本后缀递增（当前为 `v2`：数据集字段由 `epigrams` 更名为 `quotes`），避免旧缓存结构污染。
+| `epigram:data:v1:<来源序号>` | JSON 字符串 | 该来源的数据集（序号即 `DATA_SOURCES` 数组下标） |
+| `epigram:meta:v1:<来源序号>` | JSON 字符串 | `{ loaded_at, source_url, etag? }`（`etag` 为上游 ETag，用于条件请求） |
 
 ## 环境变量
 
 | 名称 | 类型 | 默认 | 说明 |
 |:---|:---|:---|:---|
-| `DATA_URL` | var | 作者维护的 `epigram-data` 仓库 raw 地址 | 数据集地址（**Fork 后请换成自己的**，见「自建部署教程」） |
+| `DATA_SOURCES` | var | 作者维护的 `epigram-data` 仓库 | 数据集来源列表（**JSON 字符串数组**，可多个；Fork 后请换成自己的，见「自建部署教程」） |
 | `DATA_TTL` | var | `300` | KV 缓存 TTL（秒） |
 | `ROOT_REDIRECT` | var | `/api/quotes/` | 根路径 302 重定向目标（仅接受站内绝对路径） |
 | `ENVIRONMENT` | var | `production` | 环境标识 |
@@ -243,9 +249,9 @@ npm install
 # 启动本地开发服务器（默认 http://127.0.0.1:8787）
 npm run dev
 
-# 需要真实数据时，把 DATA_URL 指向一个可访问的地址，例如本地静态文件服务
+# 需要真实数据时，把 DATA_SOURCES 指向一个可访问的地址，例如本地静态文件服务
 node -e "const http=require('http'),fs=require('fs');http.createServer((q,s)=>{s.setHeader('content-type','application/json');s.end(fs.readFileSync('data/data.json'))}).listen(8788)"
-npx wrangler dev --var DATA_URL:http://127.0.0.1:8788/data.json
+npx wrangler dev --var 'DATA_SOURCES:["http://127.0.0.1:8788/data.json"]'
 ```
 
 其它脚本：
@@ -277,18 +283,28 @@ npm run cf-typegen # 修改 wrangler.toml 后重新生成 worker-configuration.d
 格式见上文「数据仓库格式」——**根字段必须是 `quotes`**，每条记录至少要有非空的 `id` 与 `content`。
 可以直接复制本仓库的 [data/data.json](data/data.json) 当模板，把条目替换成你自己的。
 
-> `wrangler.toml` 中 `DATA_URL` 的注释写着「任意公网可访问、且返回符合本项目数据格式的 JSON 的链接都可以」——
+想用**多个来源**（例如「古诗词」「名人名言」各一个仓库）就重复这一步：
+每个来源都是一份格式相同的 `data.json`，运行时会被合并成一个总池。
+
+> `wrangler.toml` 中 `DATA_SOURCES` 的注释写着「任意公网可访问、且返回符合本项目数据格式的 JSON 的链接都可以」——
 > 也就是说数据集**不一定要放在 GitHub**，你自己的静态服务器 / 对象存储同样可行，只要 URL 公网可读。
 
-### 2. 把 `DATA_URL` 指向你自己的数据集
+### 2. 把 `DATA_SOURCES` 指向你自己的数据集
 
 ```toml
 [vars]
-DATA_URL = "https://raw.githubusercontent.com/<你的用户名>/my-quotes-data/main/data.json"
+# 单个来源
+DATA_SOURCES = '["https://raw.githubusercontent.com/<你的用户名>/my-quotes-data/main/data.json"]'
+
+# 多个来源：数组顺序即来源序号，对应 KV 键 epigram:data:v1:<序号>
+DATA_SOURCES = '["https://raw.githubusercontent.com/<你的用户名>/poems/main/data.json", "https://raw.githubusercontent.com/<你的用户名>/sayings/main/data.json"]'
 ```
 
 > 对应注释：「默认指向作者维护的 epigram-data 仓库；Fork 后请替换成你自己的仓库地址，**否则你改不动数据**」。
 > 保持默认值时，你的实例会一直读取作者的数据集，自己改数据不会有任何效果。
+>
+> ⚠️ `DATA_SOURCES` 必须是**合法的 JSON 字符串数组**；写错（例如不是数组、不是合法 JSON）时接口会直接报 `500`
+> 并给出提示，而不会静默回退到默认来源——避免「配置写错了却毫无察觉」。
 
 ### 3. 创建你自己的 KV 命名空间
 
@@ -363,8 +379,9 @@ curl -X POST -H "Authorization: Bearer <你的 ADMIN_TOKEN>" "$BASE/api/admin/re
 ### 常见问题
 
 - **访问根域 404？** 根域会自动 302 到 `/api/quotes/`；若你改过 `ROOT_REDIRECT`，确认它是站内绝对路径（以单个 `/` 开头）。
-- **`/api/quotes` 一直返回 500？** 通常是数据集格式不合规：根字段不是 `quotes`，或某条记录缺 `id` / `content`。
-  校验不通过时不会写入缓存，日志里会指出是第几条、哪个字段。
+- **`/api/quotes` 一直返回 500？** 说明**所有来源**都加载失败了（单个来源失败只会被跳过）。常见原因是数据集格式不合规：
+  根字段不是 `quotes`，或某条记录缺 `id` / `content`。校验不通过时不会写入缓存，日志里会指出是哪个来源、第几条、哪个字段。
+- **某个来源挂了会有影响吗？** 不会：该来源被跳过，其余来源照常提供服务；`/api/admin/stats` 的 `failures` 里能看到具体原因和 URL。
 - **管理接口返回 401？** 检查请求头为 `Authorization: Bearer <token>`，且 token 与 `ADMIN_TOKEN` 一致（secret 优先于 var）。
 - **改了 `wrangler.toml` 后类型报错？** 执行 `npm run cf-typegen` 重新生成 `worker-configuration.d.ts`。
 
@@ -425,7 +442,7 @@ curl -H "Authorization: Bearer $ADMIN_TOKEN" "$BASE/api/admin/stats"
 1. `npm test` —— 37 个用例全部通过。
 2. `npm run typecheck` —— 无类型错误。
 3. `curl -i "$BASE/"` —— 返回 `302` 且 `Location` 指向 `/api/quotes/`。
-4. `curl "$BASE/api/health"` —— `status=200`、`data.service="epigram"` 且带 `data.environment`。
+4. `curl "$BASE/api/health"` —— `status=200`、`data.service="epigram"`，且 `data.sources` 显示「已缓存 / 配置总数」。
 5. 首次 `curl "$BASE/api/quotes"` —— 返回数据且 KV 被写入；再次请求 `data.cached` 为 `true`。
 6. `curl -i -X OPTIONS "$BASE/api/quotes"` —— 返回 `Access-Control-Allow-Origin: *`。
 7. `curl -i "$BASE/api/health"` —— 含 `X-Content-Type-Options: nosniff` 与 `Referrer-Policy: no-referrer`。
@@ -434,3 +451,4 @@ curl -H "Authorization: Bearer $ADMIN_TOKEN" "$BASE/api/admin/stats"
 9. `curl -X POST "$BASE/api/admin/refresh"`（无 Token）—— 返回 `401`。
 10. `curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" "$BASE/api/admin/refresh"` —— 返回 `200` 且 `total` 与数据仓库条数一致。
 11. 把 `data.json` 中某条记录的 `content` 置空并提交 —— 管理刷新接口应返回 `500`，且 KV 中仍是上一份合法数据。
+12. 配好两个 `DATA_SOURCES` 后 `curl "$BASE/api/admin/stats"` —— `sources` 有两项，`total` 等于两个数据集条数之和。

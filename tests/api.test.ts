@@ -2,7 +2,7 @@ import { env, SELF } from 'cloudflare:test';
 import { Hono } from 'hono';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { resolveRootRedirect } from '../src/config';
-import { invalidateMemoryCache } from '../src/data/loader';
+import { invalidateMemoryCache, loadDatasetWithMeta } from '../src/data/loader';
 import { publicRateLimit } from '../src/middleware/rateLimit';
 import type { Env } from '../src/types/env';
 import { toErrorResponse } from '../src/utils/error';
@@ -112,8 +112,32 @@ const DATASET = {
   ],
 };
 
-const DATA_KEY = 'epigram:data:v2';
-const META_KEY = 'epigram:meta:v2';
+/** 第二个数据集，用于多来源合并用例。 */
+const DATASET_B = {
+  version: 2,
+  updated_at: '2026-09-27T12:00:00Z',
+  quotes: [
+    {
+      id: 'b-0001',
+      content: '来自第二个数据源的一条引语。',
+      source: '测试集',
+      author: '佚名',
+      category: '其他',
+      tags: ['测试'],
+    },
+  ],
+};
+
+// KV 键按「来源序号」区分；这里固定用 0 号来源的键做断言。
+const DATA_KEY = 'epigram:data:v1:0';
+const META_KEY = 'epigram:meta:v1:0';
+/** 多来源用例最多用到两个来源，统一清空它们的缓存。 */
+const CACHE_KEYS = [
+  'epigram:data:v1:0',
+  'epigram:meta:v1:0',
+  'epigram:data:v1:1',
+  'epigram:meta:v1:1',
+];
 const BASE = 'https://epigram.test';
 const ADMIN_TOKEN = 'dev-secret-token';
 
@@ -131,8 +155,7 @@ beforeEach(async () => {
   upstreamCalls = 0;
   // 进程内热缓存跨用例存活，必须显式清空，否则会掩盖真实的回源行为。
   invalidateMemoryCache();
-  await env.CACHE.delete(DATA_KEY);
-  await env.CACHE.delete(META_KEY);
+  await Promise.all(CACHE_KEYS.map((key) => env.CACHE.delete(key)));
 
   vi.stubGlobal('fetch', async (input: unknown) => {
     const url = input instanceof Request ? input.url : String(input);
@@ -153,15 +176,21 @@ afterEach(() => {
 
 describe('GET /api/health', () => {
   it('1. 返回 200 且 data.service === "epigram"', async () => {
-    const { res, body } = await call<{ service: string; cached: boolean; total: number }>(
-      '/api/health'
-    );
+    const { res, body } = await call<{
+      service: string;
+      cached: boolean;
+      total: number;
+      sources: { loaded: number; total: number };
+    }>('/api/health');
 
     expect(res.status).toBe(200);
     expect(res.headers.get('Access-Control-Allow-Origin')).toBe('*');
     expect(body.status).toBe(200);
     expect(body.data.service).toBe('epigram');
     expect(typeof body.data.total).toBe('number');
+    // 单来源配置：总数为 1，未预热时 loaded 为 0
+    expect(body.data.sources.total).toBe(1);
+    expect(body.data.sources.loaded).toBe(0);
   });
 });
 
@@ -580,6 +609,8 @@ describe('GET /api/admin/stats', () => {
       tags: number;
       version: number;
       updated_at: string;
+      sources: { url: string; total: number }[];
+      failures: { url: string }[];
     }>('/api/admin/stats', { headers: { Authorization: `Bearer ${ADMIN_TOKEN}` } });
 
     expect(res.status).toBe(200);
@@ -587,5 +618,107 @@ describe('GET /api/admin/stats', () => {
     expect(body.data.categories).toBe(3);
     expect(body.data.version).toBe(1);
     expect(body.data.updated_at).toBe(DATASET.updated_at);
+    // 单来源场景下，明细里应恰好有一个来源且无失败项
+    expect(body.data.sources).toHaveLength(1);
+    expect(body.data.failures).toHaveLength(0);
+  });
+});
+
+describe('多来源数据集', () => {
+  const SOURCE_A = 'https://example.test/a.json';
+  const SOURCE_B = 'https://example.test/b.json';
+
+  /** 用真实的 KV binding + 指定的来源列表拼一个最小 env。 */
+  function sourceEnv(urls: string[]): Env {
+    return { CACHE: env.CACHE, DATA_SOURCES: JSON.stringify(urls) } as unknown as Env;
+  }
+
+  /** 按 URL 返回不同数据集的上游桩；未命中的 URL 返回 404。 */
+  function stubUpstream(map: Record<string, unknown>): void {
+    vi.stubGlobal('fetch', async (input: unknown) => {
+      const url = input instanceof Request ? input.url : String(input);
+      const body = map[url];
+      if (body === undefined) return new Response('not found', { status: 404 });
+      return new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    });
+  }
+
+  it('多个来源合并成一个总池，且各自独立写入 KV', async () => {
+    stubUpstream({ [SOURCE_A]: DATASET, [SOURCE_B]: DATASET_B });
+
+    const result = await loadDatasetWithMeta(sourceEnv([SOURCE_A, SOURCE_B]));
+
+    expect(result.failures).toHaveLength(0);
+    expect(result.sources).toHaveLength(2);
+    expect(result.dataset.quotes).toHaveLength(DATASET.quotes.length + 1);
+    expect(result.cached).toBe(false);
+    // 聚合字段取各来源的较大值
+    expect(result.dataset.version).toBe(DATASET_B.version);
+    expect(result.dataset.updated_at).toBe(DATASET_B.updated_at);
+
+    // 每个来源各有一份独立缓存，互不覆盖
+    expect(await env.CACHE.get('epigram:data:v1:0')).not.toBeNull();
+    expect(await env.CACHE.get('epigram:data:v1:1')).not.toBeNull();
+  });
+
+  it('部分来源失败时跳过它，其余来源照常可用', async () => {
+    vi.stubGlobal('fetch', async (input: unknown) => {
+      const url = input instanceof Request ? input.url : String(input);
+      if (url === SOURCE_B) throw new Error('network down');
+      return new Response(JSON.stringify(DATASET), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    });
+
+    const result = await loadDatasetWithMeta(sourceEnv([SOURCE_A, SOURCE_B]));
+
+    expect(result.sources).toHaveLength(1);
+    expect(result.sources[0].index).toBe(0);
+    expect(result.failures).toHaveLength(1);
+    expect(result.failures[0].index).toBe(1);
+    expect(result.dataset.quotes).toHaveLength(DATASET.quotes.length);
+  });
+
+  it('全部来源失败时抛错（由顶层转成 500）', async () => {
+    vi.stubGlobal('fetch', async () => new Response('boom', { status: 503 }));
+
+    await expect(loadDatasetWithMeta(sourceEnv([SOURCE_A, SOURCE_B]))).rejects.toThrow(
+      /均加载失败/
+    );
+  });
+
+  it('每个来源各自命中 KV，不重复回源', async () => {
+    let calls = 0;
+    vi.stubGlobal('fetch', async (input: unknown) => {
+      calls += 1;
+      const url = input instanceof Request ? input.url : String(input);
+      const body = url === SOURCE_B ? DATASET_B : DATASET;
+      return new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    });
+
+    const scoped = sourceEnv([SOURCE_A, SOURCE_B]);
+    await loadDatasetWithMeta(scoped);
+    expect(calls).toBe(2);
+
+    // 清掉热缓存后应命中各来源的 KV，而不是再次访问上游
+    invalidateMemoryCache();
+    const second = await loadDatasetWithMeta(scoped);
+
+    expect(calls).toBe(2);
+    expect(second.cached).toBe(true);
+    expect(second.dataset.quotes).toHaveLength(DATASET.quotes.length + 1);
+  });
+
+  it('DATA_SOURCES 非法时直接报错，而不是静默回退到默认来源', async () => {
+    const broken = { CACHE: env.CACHE, DATA_SOURCES: 'not-json' } as unknown as Env;
+
+    await expect(loadDatasetWithMeta(broken)).rejects.toThrow(/DATA_SOURCES/);
   });
 });

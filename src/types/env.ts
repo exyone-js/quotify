@@ -27,8 +27,8 @@ export type Env = {
   ADMIN_RATE_LIMITER?: RateLimitBinding;
   /** 管理接口 Bearer Token，通过 `wrangler secret put ADMIN_TOKEN` 注入。 */
   ADMIN_TOKEN?: string;
-  /** 数据集原始地址（GitHub raw）。 */
-  DATA_URL?: string;
+  /** 数据集来源列表（JSON 字符串数组），可配置多个不同来源；缺省时用默认来源。 */
+  DATA_SOURCES?: string;
   /** 缓存 TTL（秒），来自 vars 的字符串。 */
   DATA_TTL?: string;
   /** 根路径 302 重定向目标（站内绝对路径），默认 `/api/quotes/`。 */

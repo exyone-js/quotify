@@ -15,7 +15,7 @@ export interface QuoteDataset {
   quotes: Quote[];
 }
 
-/** `epigram:meta:v2` 中保存的缓存元信息。 */
+/** `epigram:meta:v1` 中保存的缓存元信息。 */
 export interface DatasetMeta {
   loaded_at: number;
   source_url: string;

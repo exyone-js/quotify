@@ -1,13 +1,28 @@
 import type { Env } from './types/env';
 
-/** KV 键：完整数据集（换数据结构时升版避免旧缓存污染，当前为 v2：字段 epigrams → quotes）。 */
-export const DATA_KEY = 'epigram:data:v2';
-/** KV 键：缓存元信息。 */
-export const META_KEY = 'epigram:meta:v2';
+/**
+ * KV 键前缀。
+ *
+ * 版本后缀只在「结构不兼容变更」时递增，用于隔离旧缓存。
+ * 支持多来源后，每个来源各存一份缓存，以来源序号区分。
+ */
+export const DATA_KEY_PREFIX = 'epigram:data:v1';
+export const META_KEY_PREFIX = 'epigram:meta:v1';
 
-/** 数据集默认地址；与 `wrangler.toml` 的 `DATA_URL` 保持一致。 */
-export const DEFAULT_DATA_URL =
-  'https://raw.githubusercontent.com/exyone-js/epigram-data/main/data.json';
+/** 第 index 个来源的数据集 KV 键。 */
+export function dataKey(index: number): string {
+  return `${DATA_KEY_PREFIX}:${index}`;
+}
+
+/** 第 index 个来源的元信息 KV 键。 */
+export function metaKey(index: number): string {
+  return `${META_KEY_PREFIX}:${index}`;
+}
+
+/** 默认数据集来源；与 `wrangler.toml` 的 `DATA_SOURCES` 保持一致。 */
+export const DEFAULT_DATA_SOURCES: readonly string[] = [
+  'https://raw.githubusercontent.com/exyone-js/epigram-data/main/data.json',
+];
 
 /** 缓存默认 TTL：300 秒。 */
 export const DEFAULT_DATA_TTL = 300;
@@ -45,10 +60,36 @@ export const CORS_MAX_AGE = 86400;
  */
 export const DEFAULT_ROOT_REDIRECT = '/api/quotes/';
 
-/** 读取生效的数据集地址。 */
-export function resolveDataUrl(env: Env): string {
-  const url = env.DATA_URL?.trim();
-  return url && url.length > 0 ? url : DEFAULT_DATA_URL;
+/**
+ * 解析生效的数据集来源列表。
+ *
+ * `DATA_SOURCES` 是 JSON 字符串数组（部署期配置，数组顺序即来源序号）：
+ * `["https://.../a.json", "https://.../b.json"]`。
+ * 会去空、去重；为空则回退到默认来源。
+ *
+ * 配置非法时**直接抛错**而不是静默回退：避免「配置写错了却毫无察觉」。
+ */
+export function resolveDataSources(env: Env): string[] {
+  const raw = env.DATA_SOURCES?.trim();
+  if (!raw) return [...DEFAULT_DATA_SOURCES];
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error('DATA_SOURCES 不是合法 JSON，应形如 ["https://.../data.json"]。');
+  }
+  if (!Array.isArray(parsed)) {
+    throw new Error('DATA_SOURCES 必须是 JSON 字符串数组。');
+  }
+
+  const urls = parsed
+    .filter((item): item is string => typeof item === 'string')
+    .map((url) => url.trim())
+    .filter((url) => url.length > 0);
+
+  const unique = [...new Set(urls)];
+  return unique.length > 0 ? unique : [...DEFAULT_DATA_SOURCES];
 }
 
 /**

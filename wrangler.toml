@@ -6,10 +6,12 @@ compatibility_date = "2026-08-01"
 
 [vars]
 ENVIRONMENT = "production"
-# 数据源：任意「公网可访问、且返回符合本项目数据格式的 JSON」的链接都可以。
+# 数据源：JSON 字符串数组，可配置**多个不同来源**，随机抽取时合并成一个总池。
+# 任意「公网可访问、且返回符合本项目数据格式的 JSON」的链接都可以，例如：
+#   DATA_SOURCES = '["https://example.com/a.json", "https://example.com/b.json"]'
 # 默认指向作者维护的 epigram-data 仓库；Fork 后请替换成你自己的仓库地址，
 # 否则你改不动数据（数据格式与校验规则见 README「数据仓库格式」）。
-DATA_URL = "https://raw.githubusercontent.com/exyone-js/epigram-data/main/data.json"
+DATA_SOURCES = '["https://raw.githubusercontent.com/exyone-js/epigram-data/main/data.json"]'
 DATA_TTL = "300"
 # 访问根域（`/`）时 302 跳转的目标（站内绝对路径），默认指向公开随机一言接口
 ROOT_REDIRECT = "/api/quotes/"

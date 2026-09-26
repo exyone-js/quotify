@@ -22,13 +22,15 @@ app.use('*', cors());
 
 // 3. 健康检查：只读缓存状态，不触发回源。
 app.get('/api/health', async (c) => {
-  const { cached, loadedAt, total } = await peekCache(c.env);
+  const { cached, loadedAt, total, sourcesLoaded, sourcesTotal } = await peekCache(c.env);
   return ok({
     service: 'epigram',
     environment: c.env.ENVIRONMENT ?? 'unknown',
     cached,
     cache_loaded_at: loadedAt,
     total,
+    // 数据源就绪情况：已缓存 / 配置总数。
+    sources: { loaded: sourcesLoaded, total: sourcesTotal },
   });
 });
 

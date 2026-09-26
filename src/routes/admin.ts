@@ -19,7 +19,7 @@ admin.use('*', adminAuth());
  * 单个来源失败不影响其它来源，其错误记录在 `failures` 里；只有全部来源都失败才返回 500。
  */
 admin.post('/refresh', async (c) => {
-  const { dataset, loadedAt, sources, failures } = await refreshAllSources(c.env);
+  const { dataset, loadedAt, sources, failures, manifest } = await refreshAllSources(c.env);
 
   return ok({
     refreshed: true,
@@ -27,12 +27,13 @@ admin.post('/refresh', async (c) => {
     loaded_at: loadedAt,
     sources,
     failures,
+    manifest,
   });
 });
 
 /** GET /api/admin/stats —— 数据与缓存统计（含各来源明细）。 */
 admin.get('/stats', async (c) => {
-  const { dataset, cached, loadedAt, sources, failures } = await loadDatasetWithMeta(c.env);
+  const { dataset, cached, loadedAt, sources, failures, manifest } = await loadDatasetWithMeta(c.env);
 
   return ok({
     total: dataset.quotes.length,
@@ -44,6 +45,7 @@ admin.get('/stats', async (c) => {
     cache_loaded_at: loadedAt,
     sources,
     failures,
+    manifest,
   });
 });
 

@@ -4,19 +4,44 @@ import type { Env } from './types/env';
  * KV 键前缀。
  *
  * 版本后缀只在「结构不兼容变更」时递增，用于隔离旧缓存。
- * 支持多来源后，每个来源各存一份缓存，以来源序号区分。
+ * 每个来源各存一份缓存，键后缀由**来源 URL 派生**（而非数组下标），
+ * 这样增删 / 重排来源都不会导致缓存错位。
  */
 export const DATA_KEY_PREFIX = 'epigram:data:v1';
 export const META_KEY_PREFIX = 'epigram:meta:v1';
+export const MANIFEST_KEY_PREFIX = 'epigram:manifest:v1';
 
-/** 第 index 个来源的数据集 KV 键。 */
-export function dataKey(index: number): string {
-  return `${DATA_KEY_PREFIX}:${index}`;
+/** 单次加载允许的来源总数上限，避免清单失控导致上游调用爆炸。 */
+export const MAX_DATA_SOURCES = 20;
+
+/**
+ * FNV-1a 32 位哈希（8 位十六进制），把 URL 映射为稳定的 KV 键后缀。
+ *
+ * 哈希存在碰撞可能，但读取缓存时会比对 meta 里的 `source_url`，
+ * 真碰撞只会退化成一次「未命中 + 回源」，不会返回错数据。
+ */
+function fingerprint(input: string): string {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < input.length; i += 1) {
+    hash ^= input.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(16).padStart(8, '0');
 }
 
-/** 第 index 个来源的元信息 KV 键。 */
-export function metaKey(index: number): string {
-  return `${META_KEY_PREFIX}:${index}`;
+/** 某个来源的数据集 KV 键。 */
+export function dataKey(url: string): string {
+  return `${DATA_KEY_PREFIX}:${fingerprint(url)}`;
+}
+
+/** 某个来源的元信息 KV 键。 */
+export function metaKey(url: string): string {
+  return `${META_KEY_PREFIX}:${fingerprint(url)}`;
+}
+
+/** 来源清单文件的 KV 键。 */
+export function manifestKey(url: string): string {
+  return `${MANIFEST_KEY_PREFIX}:${fingerprint(url)}`;
 }
 
 /** 默认数据集来源；与 `wrangler.toml` 的 `DATA_SOURCES` 保持一致。 */
@@ -61,35 +86,58 @@ export const CORS_MAX_AGE = 86400;
 export const DEFAULT_ROOT_REDIRECT = '/api/quotes/';
 
 /**
- * 解析生效的数据集来源列表。
+ * 解析「JSON 字符串数组」形式的来源列表：去空、去重。
  *
- * `DATA_SOURCES` 是 JSON 字符串数组（部署期配置，数组顺序即来源序号）：
- * `["https://.../a.json", "https://.../b.json"]`。
- * 会去空、去重；为空则回退到默认来源。
- *
- * 配置非法时**直接抛错**而不是静默回退：避免「配置写错了却毫无察觉」。
+ * `DATA_SOURCES` 与来源清单文件共用这一种格式，因此解析逻辑也共用。
+ * 结构非法时抛错，由调用方决定是「致命」还是「降级」。
  */
-export function resolveDataSources(env: Env): string[] {
-  const raw = env.DATA_SOURCES?.trim();
-  if (!raw) return [...DEFAULT_DATA_SOURCES];
-
+export function parseSourceList(raw: string, label: string): string[] {
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
   } catch {
-    throw new Error('DATA_SOURCES 不是合法 JSON，应形如 ["https://.../data.json"]。');
+    throw new Error(`${label} 不是合法 JSON，应形如 ["https://.../data.json"]。`);
   }
   if (!Array.isArray(parsed)) {
-    throw new Error('DATA_SOURCES 必须是 JSON 字符串数组。');
+    throw new Error(`${label} 必须是 JSON 字符串数组。`);
   }
 
   const urls = parsed
     .filter((item): item is string => typeof item === 'string')
     .map((url) => url.trim())
     .filter((url) => url.length > 0);
+  return [...new Set(urls)];
+}
 
+/**
+ * 读取基线来源（部署期配置的 `DATA_SOURCES`）。
+ *
+ * 这是「配置」而非「运行期数据」，所以非法时**直接抛错**而不是静默回退，
+ * 避免「配置写错了却毫无察觉」；为空时才回退到默认来源。
+ */
+export function resolveBaselineSources(env: Env): string[] {
+  const raw = env.DATA_SOURCES?.trim();
+  if (!raw) return [...DEFAULT_DATA_SOURCES];
+
+  const urls = parseSourceList(raw, 'DATA_SOURCES');
+  return urls.length > 0 ? urls : [...DEFAULT_DATA_SOURCES];
+}
+
+/** 读取可选的来源清单文件地址；未配置时返回 null。 */
+export function resolveManifestUrl(env: Env): string | null {
+  const url = env.DATA_MANIFEST_URL?.trim();
+  return url && url.length > 0 ? url : null;
+}
+
+/** 合并来源并截断到上限；超出部分丢弃并告警（保留靠前的来源，顺序即优先级）。 */
+export function limitSources(urls: readonly string[]): string[] {
   const unique = [...new Set(urls)];
-  return unique.length > 0 ? unique : [...DEFAULT_DATA_SOURCES];
+  if (unique.length <= MAX_DATA_SOURCES) return unique;
+
+  console.warn(
+    `[epigram] 数据来源过多（${unique.length} 个），只取前 ${MAX_DATA_SOURCES} 个（见 MAX_DATA_SOURCES）。`
+  );
+  return unique.slice(0, MAX_DATA_SOURCES);
 }
 
 /**

@@ -29,6 +29,11 @@ export type Env = {
   ADMIN_TOKEN?: string;
   /** 数据集来源列表（JSON 字符串数组），可配置多个不同来源；缺省时用默认来源。 */
   DATA_SOURCES?: string;
+  /**
+   * 可选的「来源清单」地址：一个 JSON 字符串数组，元素是数据集 URL。
+   * 配置后可在不改动 / 不重新部署 Worker 的情况下动态增减来源。
+   */
+  DATA_MANIFEST_URL?: string;
   /** 缓存 TTL（秒），来自 vars 的字符串。 */
   DATA_TTL?: string;
   /** 根路径 302 重定向目标（站内绝对路径），默认 `/api/quotes/`。 */

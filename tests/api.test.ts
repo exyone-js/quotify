@@ -1,8 +1,18 @@
 import { env, SELF } from 'cloudflare:test';
 import { Hono } from 'hono';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { resolveRootRedirect } from '../src/config';
-import { invalidateMemoryCache, loadDatasetWithMeta } from '../src/data/loader';
+import {
+  dataKey,
+  manifestKey,
+  metaKey,
+  resolveBaselineSources,
+  resolveRootRedirect,
+} from '../src/config';
+import {
+  invalidateMemoryCache,
+  loadDatasetWithMeta,
+  refreshAllSources,
+} from '../src/data/loader';
 import { publicRateLimit } from '../src/middleware/rateLimit';
 import type { Env } from '../src/types/env';
 import { toErrorResponse } from '../src/utils/error';
@@ -128,15 +138,25 @@ const DATASET_B = {
   ],
 };
 
-// KV 键按「来源序号」区分；这里固定用 0 号来源的键做断言。
-const DATA_KEY = 'epigram:data:v1:0';
-const META_KEY = 'epigram:meta:v1:0';
-/** 多来源用例最多用到两个来源，统一清空它们的缓存。 */
+/** 部署配置里的默认来源（来自 wrangler.toml 的 DATA_SOURCES）。 */
+const SOURCE_URL = resolveBaselineSources(env as unknown as Env)[0];
+/** 多来源 / 清单用例使用的额外来源。 */
+const SOURCE_A = 'https://example.test/a.json';
+const SOURCE_B = 'https://example.test/b.json';
+const MANIFEST_URL = 'https://example.test/sources.json';
+
+// KV 键由来源 URL 派生（而不是数组下标），这里用同一套函数计算，避免测试与实现脱节。
+const DATA_KEY = dataKey(SOURCE_URL);
+const META_KEY = metaKey(SOURCE_URL);
+/** 所有用例可能用到的 KV 键，beforeEach 统一清空。 */
 const CACHE_KEYS = [
-  'epigram:data:v1:0',
-  'epigram:meta:v1:0',
-  'epigram:data:v1:1',
-  'epigram:meta:v1:1',
+  dataKey(SOURCE_URL),
+  metaKey(SOURCE_URL),
+  dataKey(SOURCE_A),
+  metaKey(SOURCE_A),
+  dataKey(SOURCE_B),
+  metaKey(SOURCE_B),
+  manifestKey(MANIFEST_URL),
 ];
 const BASE = 'https://epigram.test';
 const ADMIN_TOKEN = 'dev-secret-token';
@@ -149,6 +169,19 @@ async function call<T>(path: string, init?: RequestInit): Promise<{ res: Respons
   const res = await SELF.fetch(`${BASE}${path}`, init);
   const body = (await res.json()) as Envelope<T>;
   return { res, body };
+}
+
+/** 取 fetch 入参里的 URL。 */
+function urlOf(input: unknown): string {
+  return input instanceof Request ? input.url : String(input);
+}
+
+/** 构造一个 200 + application/json 的上游响应。 */
+function jsonResponse(body: unknown): Response {
+  return new Response(JSON.stringify(body), {
+    status: 200,
+    headers: { 'Content-Type': 'application/json' },
+  });
 }
 
 beforeEach(async () => {
@@ -611,6 +644,7 @@ describe('GET /api/admin/stats', () => {
       updated_at: string;
       sources: { url: string; total: number }[];
       failures: { url: string }[];
+      manifest: { url: string; count: number; error: string | null } | null;
     }>('/api/admin/stats', { headers: { Authorization: `Bearer ${ADMIN_TOKEN}` } });
 
     expect(res.status).toBe(200);
@@ -618,31 +652,29 @@ describe('GET /api/admin/stats', () => {
     expect(body.data.categories).toBe(3);
     expect(body.data.version).toBe(1);
     expect(body.data.updated_at).toBe(DATASET.updated_at);
-    // 单来源场景下，明细里应恰好有一个来源且无失败项
+    // 单来源场景下，明细里应恰好有一个来源且无失败项；未配置清单时 manifest 为 null
     expect(body.data.sources).toHaveLength(1);
     expect(body.data.failures).toHaveLength(0);
+    expect(body.data.manifest).toBeNull();
   });
 });
 
 describe('多来源数据集', () => {
-  const SOURCE_A = 'https://example.test/a.json';
-  const SOURCE_B = 'https://example.test/b.json';
-
-  /** 用真实的 KV binding + 指定的来源列表拼一个最小 env。 */
-  function sourceEnv(urls: string[]): Env {
-    return { CACHE: env.CACHE, DATA_SOURCES: JSON.stringify(urls) } as unknown as Env;
+  /** 用真实的 KV binding + 指定的来源 / 清单配置拼一个最小 env。 */
+  function sourceEnv(urls: string[], manifestUrl = ''): Env {
+    return {
+      CACHE: env.CACHE,
+      DATA_SOURCES: JSON.stringify(urls),
+      DATA_MANIFEST_URL: manifestUrl,
+    } as unknown as Env;
   }
 
   /** 按 URL 返回不同数据集的上游桩；未命中的 URL 返回 404。 */
   function stubUpstream(map: Record<string, unknown>): void {
     vi.stubGlobal('fetch', async (input: unknown) => {
-      const url = input instanceof Request ? input.url : String(input);
-      const body = map[url];
+      const body = map[urlOf(input)];
       if (body === undefined) return new Response('not found', { status: 404 });
-      return new Response(JSON.stringify(body), {
-        status: 200,
-        headers: { 'Content-Type': 'application/json' },
-      });
+      return jsonResponse(body);
     });
   }
 
@@ -659,27 +691,23 @@ describe('多来源数据集', () => {
     expect(result.dataset.version).toBe(DATASET_B.version);
     expect(result.dataset.updated_at).toBe(DATASET_B.updated_at);
 
-    // 每个来源各有一份独立缓存，互不覆盖
-    expect(await env.CACHE.get('epigram:data:v1:0')).not.toBeNull();
-    expect(await env.CACHE.get('epigram:data:v1:1')).not.toBeNull();
+    // 每个来源各有一份独立缓存，互不覆盖（键由 URL 派生）
+    expect(await env.CACHE.get(dataKey(SOURCE_A))).not.toBeNull();
+    expect(await env.CACHE.get(dataKey(SOURCE_B))).not.toBeNull();
   });
 
   it('部分来源失败时跳过它，其余来源照常可用', async () => {
     vi.stubGlobal('fetch', async (input: unknown) => {
-      const url = input instanceof Request ? input.url : String(input);
-      if (url === SOURCE_B) throw new Error('network down');
-      return new Response(JSON.stringify(DATASET), {
-        status: 200,
-        headers: { 'Content-Type': 'application/json' },
-      });
+      if (urlOf(input) === SOURCE_B) throw new Error('network down');
+      return jsonResponse(DATASET);
     });
 
     const result = await loadDatasetWithMeta(sourceEnv([SOURCE_A, SOURCE_B]));
 
     expect(result.sources).toHaveLength(1);
-    expect(result.sources[0].index).toBe(0);
+    expect(result.sources[0].url).toBe(SOURCE_A);
     expect(result.failures).toHaveLength(1);
-    expect(result.failures[0].index).toBe(1);
+    expect(result.failures[0].url).toBe(SOURCE_B);
     expect(result.dataset.quotes).toHaveLength(DATASET.quotes.length);
   });
 
@@ -695,12 +723,7 @@ describe('多来源数据集', () => {
     let calls = 0;
     vi.stubGlobal('fetch', async (input: unknown) => {
       calls += 1;
-      const url = input instanceof Request ? input.url : String(input);
-      const body = url === SOURCE_B ? DATASET_B : DATASET;
-      return new Response(JSON.stringify(body), {
-        status: 200,
-        headers: { 'Content-Type': 'application/json' },
-      });
+      return jsonResponse(urlOf(input) === SOURCE_B ? DATASET_B : DATASET);
     });
 
     const scoped = sourceEnv([SOURCE_A, SOURCE_B]);
@@ -720,5 +743,113 @@ describe('多来源数据集', () => {
     const broken = { CACHE: env.CACHE, DATA_SOURCES: 'not-json' } as unknown as Env;
 
     await expect(loadDatasetWithMeta(broken)).rejects.toThrow(/DATA_SOURCES/);
+  });
+
+  it('来源重排后仍各自命中自己的缓存，不会串数据', async () => {
+    let calls = 0;
+    vi.stubGlobal('fetch', async (input: unknown) => {
+      calls += 1;
+      return jsonResponse(urlOf(input) === SOURCE_B ? DATASET_B : DATASET);
+    });
+
+    await loadDatasetWithMeta(sourceEnv([SOURCE_A, SOURCE_B]));
+    expect(calls).toBe(2);
+
+    // 清掉热缓存后颠倒顺序：键若按下标编，就会把 A 的缓存当成 B 的数据返回
+    invalidateMemoryCache();
+    const reversed = await loadDatasetWithMeta(sourceEnv([SOURCE_B, SOURCE_A]));
+
+    expect(calls).toBe(2); // 两边都命中各自缓存，无需回源
+    expect(reversed.cached).toBe(true);
+    expect(reversed.sources.find((item) => item.url === SOURCE_B)?.total).toBe(
+      DATASET_B.quotes.length
+    );
+    expect(reversed.sources.find((item) => item.url === SOURCE_A)?.total).toBe(
+      DATASET.quotes.length
+    );
+  });
+
+  it('缓存声明的来源地址与当前来源不一致时视为未命中并回源', async () => {
+    // 人为把 B 的数据写到 A 的键上，并声明来源是 B
+    await env.CACHE.put(dataKey(SOURCE_A), JSON.stringify(DATASET_B), { expirationTtl: 300 });
+    await env.CACHE.put(metaKey(SOURCE_A), JSON.stringify({ loaded_at: 1, source_url: SOURCE_B }), {
+      expirationTtl: 300,
+    });
+
+    let calls = 0;
+    vi.stubGlobal('fetch', async () => {
+      calls += 1;
+      return jsonResponse(DATASET);
+    });
+
+    const result = await loadDatasetWithMeta(sourceEnv([SOURCE_A]));
+
+    expect(calls).toBe(1); // 来源不匹配 → 回源
+    expect(result.dataset.quotes).toHaveLength(DATASET.quotes.length); // 拿到 A 的数据而非 B 的
+  });
+});
+
+describe('来源清单（动态来源）', () => {
+  function sourceEnv(urls: string[], manifestUrl: string): Env {
+    return {
+      CACHE: env.CACHE,
+      DATA_SOURCES: JSON.stringify(urls),
+      DATA_MANIFEST_URL: manifestUrl,
+    } as unknown as Env;
+  }
+
+  /** 清单地址返回指定响应；SOURCE_B 返回 DATASET_B，其余地址返回 DATASET。传工厂函数以免 Response 被重复消费。 */
+  function stubWithManifest(manifestResponse: () => Response): void {
+    vi.stubGlobal('fetch', async (input: unknown) => {
+      const url = urlOf(input);
+      if (url === MANIFEST_URL) return manifestResponse();
+      if (url === SOURCE_B) return jsonResponse(DATASET_B);
+      return jsonResponse(DATASET);
+    });
+  }
+
+  it('清单里的来源会与 DATA_SOURCES 合并', async () => {
+    stubWithManifest(() => jsonResponse([SOURCE_B]));
+
+    const result = await loadDatasetWithMeta(sourceEnv([SOURCE_A], MANIFEST_URL));
+
+    expect(result.manifest).toEqual({ url: MANIFEST_URL, count: 1, error: null });
+    expect(result.sources).toHaveLength(2);
+    expect(result.dataset.quotes).toHaveLength(DATASET.quotes.length + 1);
+    expect(await env.CACHE.get(manifestKey(MANIFEST_URL))).not.toBeNull();
+  });
+
+  it('未配置清单时 manifest 为 null', async () => {
+    vi.stubGlobal('fetch', async () => jsonResponse(DATASET));
+
+    const result = await loadDatasetWithMeta(sourceEnv([SOURCE_A], ''));
+
+    expect(result.manifest).toBeNull();
+  });
+
+  it('清单不可用时降级为仅用 DATA_SOURCES，并记录错误', async () => {
+    stubWithManifest(() => new Response('boom', { status: 500 }));
+
+    const result = await loadDatasetWithMeta(sourceEnv([SOURCE_A], MANIFEST_URL));
+
+    expect(result.manifest?.error).toBeTruthy();
+    expect(result.manifest?.count).toBe(0);
+    expect(result.dataset.quotes).toHaveLength(DATASET.quotes.length); // 服务仍然可用
+    expect(result.failures).toHaveLength(0);
+  });
+
+  it('清单内容非法时沿用上一份合法清单，且不覆盖缓存', async () => {
+    const scoped = sourceEnv([SOURCE_A], MANIFEST_URL);
+    stubWithManifest(() => jsonResponse([SOURCE_B]));
+    await loadDatasetWithMeta(scoped);
+
+    // 清单变成非法 JSON，并强制刷新
+    invalidateMemoryCache();
+    stubWithManifest(() => new Response('not-json', { status: 200 }));
+    const result = await refreshAllSources(scoped);
+
+    expect(result.manifest?.error).toContain('格式非法');
+    expect(result.manifest?.count).toBe(1); // 沿用上一份合法清单
+    expect(result.dataset.quotes).toHaveLength(DATASET.quotes.length + 1);
   });
 });

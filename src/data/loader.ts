@@ -3,9 +3,13 @@ import {
   GITHUB_CACHE_TTL,
   MEMORY_CACHE_TTL_MS,
   dataKey,
+  limitSources,
+  manifestKey,
   metaKey,
-  resolveDataSources,
+  parseSourceList,
+  resolveBaselineSources,
   resolveDataTtl,
+  resolveManifestUrl,
 } from '../config';
 import type { Env } from '../types/env';
 import { UpstreamError } from '../utils/error';
@@ -13,7 +17,6 @@ import type { DatasetMeta, Quote, QuoteDataset } from './types';
 
 /** 某个来源的加载状态（对外可序列化，不含数据集本体）。 */
 export interface SourceState {
-  index: number;
   url: string;
   total: number;
   loadedAt: number | null;
@@ -23,9 +26,17 @@ export interface SourceState {
 
 /** 某个来源的失败信息。 */
 export interface SourceFailure {
-  index: number;
   url: string;
   error: string;
+}
+
+/** 来源清单的加载状态（未配置清单时为 null）。 */
+export interface ManifestState {
+  url: string;
+  /** 清单里解析出的来源个数。 */
+  count: number;
+  /** 清单加载 / 解析出错时的原因；正常时为 null。 */
+  error: string | null;
 }
 
 /** 聚合后的加载结果。 */
@@ -40,6 +51,8 @@ export interface LoadResult {
   sources: SourceState[];
   /** 加载失败、未参与合并的来源。 */
   failures: SourceFailure[];
+  /** 来源清单状态；未配置 `DATA_MANIFEST_URL` 时为 null。 */
+  manifest: ManifestState | null;
 }
 
 /** 单个来源的 KV 快照。 */
@@ -66,8 +79,21 @@ interface SourceOutcome {
 interface MemoryEntry {
   result: LoadResult;
   expiresAt: number;
-  /** 来源列表指纹；来源配置变化后立即失效。 */
-  sourcesKey: string;
+  /** 配置指纹（基线来源 + 清单地址）；配置变化后立即失效。 */
+  configKey: string;
+}
+
+/** 清单文件的 KV 记录：自包含原文 + 加载时间 + ETag。 */
+interface ManifestRecord {
+  raw: string;
+  loadedAt: number;
+  etag: string | null;
+}
+
+/** 清单加载结果：解析出的来源 + 对外披露的状态。 */
+interface ManifestResult {
+  urls: string[];
+  state: ManifestState;
 }
 
 let memory: MemoryEntry | null = null;
@@ -82,18 +108,23 @@ export function invalidateMemoryCache(): void {
   memory = null;
 }
 
-/** 读取命中的热缓存：来源列表不一致或已过期都视为未命中。 */
-function readMemory(sourcesKey: string): LoadResult | null {
-  if (memory === null || memory.sourcesKey !== sourcesKey || memory.expiresAt <= Date.now()) {
+/** 读取命中的热缓存：配置指纹不一致或已过期都视为未命中。 */
+function readMemory(configKey: string): LoadResult | null {
+  if (memory === null || memory.configKey !== configKey || memory.expiresAt <= Date.now()) {
     return null;
   }
   return memory.result;
 }
 
 /** 写入热缓存并返回原结果，便于链式返回。 */
-function writeMemory(result: LoadResult, sourcesKey: string): LoadResult {
-  memory = { result, expiresAt: Date.now() + MEMORY_CACHE_TTL_MS, sourcesKey };
+function writeMemory(result: LoadResult, configKey: string): LoadResult {
+  memory = { result, expiresAt: Date.now() + MEMORY_CACHE_TTL_MS, configKey };
   return result;
+}
+
+/** 由「基线来源 + 清单地址」构成的配置指纹，用于热缓存失效判断。 */
+function configKeyOf(baseline: readonly string[], manifestUrl: string | null): string {
+  return `${baseline.join('\n')}|${manifestUrl ?? ''}`;
 }
 
 /** 取多个时间戳中的最大值；全为 null 时返回 null。 */
@@ -207,35 +238,59 @@ export function parseDataset(raw: string, label = '数据集'): QuoteDataset {
   return validateDataset(parsed, label);
 }
 
+/** 缓存元信息中我们关心的字段。 */
+interface ParsedMeta {
+  loadedAt: number | null;
+  etag: string | null;
+  sourceUrl: string | null;
+}
+
 /** 解析缓存元信息；缺失或损坏时返回空值（只影响展示与条件请求，不影响数据本身）。 */
-function parseMeta(metaRaw: string | null): { loadedAt: number | null; etag: string | null } {
-  if (metaRaw === null) return { loadedAt: null, etag: null };
+function parseMeta(metaRaw: string | null): ParsedMeta {
+  if (metaRaw === null) return { loadedAt: null, etag: null, sourceUrl: null };
   try {
-    const { loaded_at: loadedAt, etag } = JSON.parse(metaRaw) as Partial<DatasetMeta>;
+    const { loaded_at: loadedAt, etag, source_url: sourceUrl } = JSON.parse(metaRaw) as Partial<DatasetMeta>;
     return {
       loadedAt: typeof loadedAt === 'number' ? loadedAt : null,
       etag: typeof etag === 'string' && etag.length > 0 ? etag : null,
+      sourceUrl: typeof sourceUrl === 'string' && sourceUrl.length > 0 ? sourceUrl : null,
     };
   } catch {
-    return { loadedAt: null, etag: null };
+    return { loadedAt: null, etag: null, sourceUrl: null };
   }
 }
 
-/** 读取某个来源的 KV 快照：不存在返回 null；损坏则连同元信息清理并返回 null（触发回源）。 */
-async function readSnapshot(env: Env, index: number): Promise<SourceSnapshot | null> {
+/**
+ * 读取某个来源的 KV 快照：不存在返回 null；损坏则连同元信息清理并返回 null（触发回源）。
+ *
+ * 读取时会比对 meta 里的 `source_url`：键虽由 URL 派生，但哈希碰撞或人工写错键
+ * 都可能让「别的来源的数据」落在同一个键上，比对不一致就当作未命中，杜绝串数据。
+ */
+async function readSnapshot(env: Env, url: string): Promise<SourceSnapshot | null> {
   // 数据集与元信息并发读取，避免两次串行的 KV 往返。
   const [raw, metaRaw] = await Promise.all([
-    env.CACHE.get(dataKey(index)),
-    env.CACHE.get(metaKey(index)),
+    env.CACHE.get(dataKey(url)),
+    env.CACHE.get(metaKey(url)),
   ]);
   if (raw === null) return null;
 
   try {
-    const { loadedAt, etag } = parseMeta(metaRaw);
-    return { dataset: validateDataset(JSON.parse(raw), '缓存'), raw, loadedAt, etag };
+    const meta = parseMeta(metaRaw);
+    if (meta.sourceUrl !== null && meta.sourceUrl !== url) {
+      console.warn(
+        `[epigram] 缓存来源不匹配（期望 ${url}，实际 ${meta.sourceUrl}），忽略该缓存并回源。`
+      );
+      return null;
+    }
+    return {
+      dataset: validateDataset(JSON.parse(raw), '缓存'),
+      raw,
+      loadedAt: meta.loadedAt,
+      etag: meta.etag,
+    };
   } catch (err) {
-    console.error(`[epigram] KV 缓存损坏（来源 #${index}），已删除并回源：`, err);
-    await Promise.all([env.CACHE.delete(dataKey(index)), env.CACHE.delete(metaKey(index))]);
+    console.error(`[epigram] KV 缓存损坏（${url}），已删除并回源：`, err);
+    await Promise.all([env.CACHE.delete(dataKey(url)), env.CACHE.delete(metaKey(url))]);
     return null;
   }
 }
@@ -272,13 +327,13 @@ async function fetchUpstream(url: string, etag: string | null): Promise<Upstream
       return { status: 304, text: null, etag };
     }
     if (!res.ok) {
-      throw new UpstreamError(`数据源 ${url} 返回 ${res.status}。`);
+      throw new UpstreamError(`远程 ${url} 返回 ${res.status}。`);
     }
     return { status: res.status, text: await res.text(), etag: res.headers.get('ETag') };
   } catch (err) {
     if (err instanceof UpstreamError) throw err;
     const reason = err instanceof Error ? err.message : String(err);
-    throw new UpstreamError(`数据源 ${url} 请求失败：${reason}`);
+    throw new UpstreamError(`远程 ${url} 请求失败：${reason}`);
   } finally {
     clearTimeout(timer);
   }
@@ -287,7 +342,6 @@ async function fetchUpstream(url: string, etag: string | null): Promise<Upstream
 /** 回写某个来源的数据集与元信息（同时重置 TTL）。 */
 async function writeCache(
   env: Env,
-  index: number,
   url: string,
   raw: string,
   loadedAt: number,
@@ -298,8 +352,8 @@ async function writeCache(
   if (etag !== null) meta.etag = etag;
 
   await Promise.all([
-    env.CACHE.put(dataKey(index), raw, { expirationTtl: ttl }),
-    env.CACHE.put(metaKey(index), JSON.stringify(meta), { expirationTtl: ttl }),
+    env.CACHE.put(dataKey(url), raw, { expirationTtl: ttl }),
+    env.CACHE.put(metaKey(url), JSON.stringify(meta), { expirationTtl: ttl }),
   ]);
 }
 
@@ -308,17 +362,11 @@ async function writeCache(
  *
  * @param force 为 true 时即使命中 KV 也要走一次条件请求（管理端强制刷新用）。
  */
-async function loadSource(
-  env: Env,
-  index: number,
-  url: string,
-  force: boolean
-): Promise<LoadedSource> {
-  const snapshot = await readSnapshot(env, index);
+async function loadSource(env: Env, url: string, force: boolean): Promise<LoadedSource> {
+  const snapshot = await readSnapshot(env, url);
 
   if (!force && snapshot !== null) {
     return {
-      index,
       url,
       dataset: snapshot.dataset,
       total: snapshot.dataset.quotes.length,
@@ -332,13 +380,12 @@ async function loadSource(
   if (upstream.status === 304) {
     if (snapshot === null) {
       // 没有本地数据时不会携带 If-None-Match，理论上不可达；显式兜底避免死循环。
-      throw new UpstreamError(`数据源 ${url} 返回 304，但本地没有可用缓存。`);
+      throw new UpstreamError(`${url} 返回 304，但本地没有可用缓存。`);
     }
     // 上游未变更：复用缓存数据，仅重置 KV 过期时间。
     const loadedAt = snapshot.loadedAt ?? Date.now();
-    await writeCache(env, index, url, snapshot.raw, loadedAt, snapshot.etag);
+    await writeCache(env, url, snapshot.raw, loadedAt, snapshot.etag);
     return {
-      index,
       url,
       dataset: snapshot.dataset,
       total: snapshot.dataset.quotes.length,
@@ -348,35 +395,146 @@ async function loadSource(
   }
 
   const raw = upstream.text ?? '';
-  const dataset = parseDataset(raw, `数据源 ${url} `);
+  const dataset = parseDataset(raw, `来源 ${url} `);
   const loadedAt = Date.now();
-  await writeCache(env, index, url, raw, loadedAt, upstream.etag);
-  return {
-    index,
-    url,
-    dataset,
-    total: dataset.quotes.length,
-    loadedAt,
-    cached: false,
-  };
+  await writeCache(env, url, raw, loadedAt, upstream.etag);
+  return { url, dataset, total: dataset.quotes.length, loadedAt, cached: false };
+}
+
+// ---------------------------------------------------------------------------
+// 来源清单（可选）：把「来源列表」从部署期配置变成运行期数据
+// ---------------------------------------------------------------------------
+
+/** 读取清单的 KV 记录；不存在返回 null，损坏则删除并返回 null。 */
+async function readManifestRecord(env: Env, key: string): Promise<ManifestRecord | null> {
+  const raw = await env.CACHE.get(key);
+  if (raw === null) return null;
+
+  try {
+    const record = JSON.parse(raw) as Partial<ManifestRecord>;
+    if (typeof record.raw !== 'string') {
+      throw new Error('清单缓存缺少 raw 字段。');
+    }
+    return {
+      raw: record.raw,
+      loadedAt: typeof record.loadedAt === 'number' ? record.loadedAt : 0,
+      etag: typeof record.etag === 'string' && record.etag.length > 0 ? record.etag : null,
+    };
+  } catch (err) {
+    console.error('[epigram] 清单缓存损坏，已删除：', err);
+    await env.CACHE.delete(key);
+    return null;
+  }
+}
+
+/** 回写清单缓存（TTL 与数据集一致）。 */
+async function writeManifestRecord(
+  env: Env,
+  key: string,
+  raw: string,
+  loadedAt: number,
+  etag: string | null
+): Promise<void> {
+  const record: ManifestRecord = { raw, loadedAt, etag };
+  await env.CACHE.put(key, JSON.stringify(record), { expirationTtl: resolveDataTtl(env) });
 }
 
 /**
- * 并发加载全部来源，并合并成一个统一池。
+ * 把清单原文解析为来源列表。
+ *
+ * 清单属于「运行期数据」（可能被协作者随手改动），格式非法时**降级**为
+ * 「沿用上一份合法清单 / 不加额外来源」，而不是让整个服务不可用；
+ * 失败原因会记录到日志与 `manifest.error`，不会静默。
+ */
+function parseManifestUrls(raw: string, url: string): string[] | null {
+  try {
+    return parseSourceList(raw, `清单文件 ${url}`);
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    console.error(`[epigram] 清单文件格式非法（${url}）：${reason}`);
+    return null;
+  }
+}
+
+/**
+ * 加载「来源清单」：一个 JSON 字符串数组，元素为数据集 URL（与 `DATA_SOURCES` 同格式）。
+ *
+ * @param force      为 true 时强制走条件请求刷新（管理端 `/refresh` 用）
+ * @param allowFetch 为 false 时只读 KV、绝不回源（健康检查用）
+ */
+async function loadManifest(
+  env: Env,
+  force: boolean,
+  allowFetch = true
+): Promise<ManifestResult | null> {
+  const url = resolveManifestUrl(env);
+  if (url === null) return null;
+
+  const key = manifestKey(url);
+  const record = await readManifestRecord(env, key);
+  /** 用缓存里的清单内容兜底：没有缓存就是「不加额外来源」。 */
+  const cachedUrls = (): string[] =>
+    record === null ? [] : (parseManifestUrls(record.raw, url) ?? []);
+  const done = (urls: string[], error: string | null): ManifestResult => ({
+    urls,
+    state: { url, count: urls.length, error },
+  });
+
+  if (!force && record !== null) {
+    return done(cachedUrls(), null);
+  }
+  if (!allowFetch) {
+    return done(cachedUrls(), null);
+  }
+
+  try {
+    const upstream = await fetchUpstream(url, record?.etag ?? null);
+
+    if (upstream.status === 304 && record !== null) {
+      await writeManifestRecord(
+        env,
+        key,
+        record.raw,
+        record.loadedAt > 0 ? record.loadedAt : Date.now(),
+        record.etag
+      );
+      return done(cachedUrls(), null);
+    }
+
+    const raw = upstream.text ?? '';
+    const parsed = parseManifestUrls(raw, url);
+    if (parsed === null) {
+      // 内容非法：保留上一份合法清单，不回写 KV。
+      return done(cachedUrls(), '清单文件格式非法，已沿用上一份缓存');
+    }
+    await writeManifestRecord(env, key, raw, Date.now(), upstream.etag);
+    return done(parsed, null);
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    console.error(`[epigram] 清单文件加载失败（${url}）：${reason}`);
+    return done(cachedUrls(), reason);
+  }
+}
+
+/**
+ * 加载全部来源（基线 + 可选清单）并合并成一个统一池。
  *
  * 容错策略：单个来源失败不拖垮整体——该来源被跳过并记入 `failures`（同时打日志），
  * 其余来源照常合并；只有**全部来源都失败**才抛错（由顶层转成 500）。
  * 这样个别上游抖动时 API 仍然可用，只少了一部分内容。
  */
-async function loadAllSources(env: Env, urls: string[], force: boolean): Promise<LoadResult> {
+async function loadAggregate(env: Env, baseline: string[], force: boolean): Promise<LoadResult> {
+  const manifest = await loadManifest(env, force);
+  const urls = limitSources([...baseline, ...(manifest?.urls ?? [])]);
+
   const outcomes = await Promise.all(
-    urls.map(async (url, index): Promise<SourceOutcome> => {
+    urls.map(async (url): Promise<SourceOutcome> => {
       try {
-        return { state: await loadSource(env, index, url, force), failure: null };
+        return { state: await loadSource(env, url, force), failure: null };
       } catch (err) {
         const reason = err instanceof Error ? err.message : String(err);
-        console.error(`[epigram] 数据源加载失败（#${index} ${url}）：${reason}`);
-        return { state: null, failure: { index, url, error: reason } };
+        console.error(`[epigram] 数据来源加载失败（${url}）：${reason}`);
+        return { state: null, failure: { url, error: reason } };
       }
     })
   );
@@ -393,7 +551,7 @@ async function loadAllSources(env: Env, urls: string[], force: boolean): Promise
     if (urls.length === 1 && failures.length === 1) {
       throw new UpstreamError(failures[0].error);
     }
-    const detail = failures.map((item) => `#${item.index} ${item.url}：${item.error}`).join('；');
+    const detail = failures.map((item) => `${item.url}：${item.error}`).join('；');
     throw new UpstreamError(`全部 ${urls.length} 个数据源均加载失败。${detail}`);
   }
 
@@ -408,24 +566,20 @@ async function loadAllSources(env: Env, urls: string[], force: boolean): Promise
     dataset,
     cached: loaded.every((item) => item.cached),
     loadedAt: maxLoadedAt(loaded.map((item) => item.loadedAt)),
-    sources: loaded.map(({ index, url, total, loadedAt, cached }) => ({
-      index,
-      url,
-      total,
-      loadedAt,
-      cached,
-    })),
+    sources: loaded.map(({ url, total, loadedAt, cached }) => ({ url, total, loadedAt, cached })),
     failures,
+    manifest: manifest?.state ?? null,
   };
 }
 
 /**
- * 强制刷新全部来源（管理端 `/refresh` 使用）。
- * 单个来源校验失败或拉取失败都不会污染它已有的缓存；全部失败时抛错。
+ * 强制刷新全部来源与清单（管理端 `/refresh` 使用）。
+ * 单个来源校验失败或拉取失败都不会污染它已有的缓存；全部来源失败时抛错。
  */
 export async function refreshAllSources(env: Env): Promise<LoadResult> {
-  const urls = resolveDataSources(env);
-  return writeMemory(await loadAllSources(env, urls, true), urls.join('\n'));
+  const baseline = resolveBaselineSources(env);
+  const configKey = configKeyOf(baseline, resolveManifestUrl(env));
+  return writeMemory(await loadAggregate(env, baseline, true), configKey);
 }
 
 /**
@@ -434,13 +588,13 @@ export async function refreshAllSources(env: Env): Promise<LoadResult> {
  * `cached` 为 true 表示本次完全没有回源上游；只要有来源走了上游即为 false。
  */
 export async function loadDatasetWithMeta(env: Env): Promise<LoadResult> {
-  const urls = resolveDataSources(env);
-  const sourcesKey = urls.join('\n');
+  const baseline = resolveBaselineSources(env);
+  const configKey = configKeyOf(baseline, resolveManifestUrl(env));
 
-  const hot = readMemory(sourcesKey);
+  const hot = readMemory(configKey);
   if (hot !== null) return { ...hot, cached: true };
 
-  return writeMemory(await loadAllSources(env, urls, false), sourcesKey);
+  return writeMemory(await loadAggregate(env, baseline, false), configKey);
 }
 
 /** 只需要合并后数据集时的便捷封装。 */
@@ -457,21 +611,23 @@ export async function peekCache(env: Env): Promise<{
   sourcesLoaded: number;
   sourcesTotal: number;
 }> {
-  const urls = resolveDataSources(env);
+  const baseline = resolveBaselineSources(env);
 
-  const hot = readMemory(urls.join('\n'));
+  const hot = readMemory(configKeyOf(baseline, resolveManifestUrl(env)));
   if (hot !== null) {
     return {
       cached: true,
       loadedAt: hot.loadedAt,
       total: hot.dataset.quotes.length,
       sourcesLoaded: hot.sources.length,
-      sourcesTotal: urls.length,
+      sourcesTotal: hot.sources.length + hot.failures.length,
     };
   }
 
-  // 热缓存未命中时逐个来源只读 KV（并发），不触发任何回源。
-  const snapshots = await Promise.all(urls.map((_, index) => readSnapshot(env, index)));
+  // 冷路径：清单与各来源都只读 KV（并发），不触发任何回源。
+  const manifest = await loadManifest(env, false, false);
+  const urls = limitSources([...baseline, ...(manifest?.urls ?? [])]);
+  const snapshots = await Promise.all(urls.map((url) => readSnapshot(env, url)));
   const available = snapshots.filter((item): item is SourceSnapshot => item !== null);
 
   return {

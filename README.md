@@ -11,25 +11,30 @@
 - 运行时：Cloudflare Workers（V8 Isolates）
 - 语言：TypeScript（`strict: true`，禁用 `any`）
 - 框架：Hono
-- 数据源：`DATA_SOURCES` 配置的多个来源，每个来源独立缓存、独立容错
+- 数据源：`DATA_SOURCES` 配置的多个来源 + 可选的 `DATA_MANIFEST_URL` 清单（改文件即可动态增减，无需重新部署），
+  每个来源独立缓存、独立容错
 - 缓存：Cloudflare KV（每个来源各缓存一份，TTL 300 秒）
 - 限流：Cloudflare Rate Limiting Binding（公开 60 次/分钟/IP，管理 10 次/分钟/IP）
 - 测试：Vitest + `@cloudflare/vitest-pool-workers`（测试真实运行在 Workers 运行时中）
-- bundle：约 88 KiB（gzip 约 22 KiB），远低于 1 MB 上限
+- bundle：约 93 KiB（gzip 约 23 KiB），远低于 1 MB 上限
 
 ## 架构
 
 ```text
+来源清单 sources.json（可选，DATA_MANIFEST_URL）
+   │  ["url", "url", ...]（与 DATA_SOURCES 同格式）
+   ▼
 数据源 0..n（GitHub raw / 任意 HTTPS）
    │  data.json × n（每个来源格式相同）
    ▼
 Cloudflare Worker (epigram-api)
    │  1. 进程内热缓存（60s，避免每请求重复解析）—— 命中即返回
-   │  2. 并发查各来源的 KV 缓存 (epigram:data:v1:<来源序号>)
-   │  3. 未命中 / 过期 → 并发回源
+   │  2. 解析来源列表 = DATA_SOURCES + 清单（去重、截断到 20 个）
+   │  3. 并发查各来源的 KV 缓存 (epigram:data:v1:<URL 指纹>)
+   │  4. 未命中 / 过期 → 并发回源
    │     （5s 超时 + 边缘缓存 60s；携带 If-None-Match，304 则复用旧数据并续期）
-   │  4. 校验 JSON → 各来源回写自己的 KV (TTL 300s) + meta（含上游 ETag）
-   │  5. 合并所有可用来源为一个总池（单个来源失败只跳过它，不拖垮整体）
+   │  5. 校验 JSON → 各来源回写自己的 KV (TTL 300s) + meta（含来源 URL 与上游 ETag）
+   │  6. 合并所有可用来源为一个总池（单个来源失败只跳过它，不拖垮整体）
    ▼
 Cloudflare KV (epigram-cache)
    ▼
@@ -45,7 +50,7 @@ API 响应
 epigram/
 ├── src/
 │   ├── index.ts              # Worker 入口：安全头、CORS、根域重定向、健康检查、路由挂载、统一错误处理
-│   ├── config.ts             # 常量、KV 键名、默认配置
+│   ├── config.ts             # 常量、KV 键（URL 指纹）、来源列表解析、默认配置
 │   ├── routes/
 │   │   ├── quotes.ts         # 公开查询路由
 │   │   └── admin.ts          # 管理路由
@@ -164,7 +169,7 @@ epigram/
 ### `POST /api/admin/refresh` — 强制刷新缓存（需鉴权）
 
 对**每个来源**分别「重新拉取 → 校验通过后覆盖自己的 KV」（`put` 会重置值与 TTL）。**不会**先删键：
-这样上游数据非法时该来源的缓存仍保留上一份合法数据，不会出现空缓存窗口。
+这样上游数据非法时该来源的缓存仍保留上一份合法数据，不会出现空缓存窗口。若配置了来源清单，清单也会一并刷新。
 
 单个来源失败不影响其它来源：其结果记录在 `failures` 里，服务照常使用其余来源；只有**全部来源都失败**才返回 `500`。
 
@@ -172,13 +177,14 @@ epigram/
 不重新下载与解析正文；此时 `total` 仍与当前数据集一致。
 
 ```json
-{ "status": 200, "message": "ok.", "data": { "refreshed": true, "total": 1204, "loaded_at": 1759000000000, "sources": [{ "index": 0, "url": "https://.../a.json", "total": 600, "loaded_at": 1759000000000, "cached": false }], "failures": [] }, "ts": 1759000000123 }
+{ "status": 200, "message": "ok.", "data": { "refreshed": true, "total": 1204, "loaded_at": 1759000000000, "sources": [{ "url": "https://.../a.json", "total": 600, "loaded_at": 1759000000000, "cached": false }], "failures": [], "manifest": { "url": "https://.../sources.json", "count": 2, "error": null } }, "ts": 1759000000123 }
 ```
 
 ### `GET /api/admin/stats` — 数据统计（需鉴权）
 
-返回 `{ total, categories, tags, version, updated_at, cached, cache_loaded_at, sources, failures }`。
-其中 `version` / `updated_at` 是各来源的**聚合值**（取较大者），按来源的明细在 `sources` 与 `failures` 中。
+返回 `{ total, categories, tags, version, updated_at, cached, cache_loaded_at, sources, failures, manifest }`。
+其中 `version` / `updated_at` 是各来源的**聚合值**（取较大者），按来源的明细在 `sources` 与 `failures` 中；
+`manifest` 是清单状态 `{ url, count, error }`，未配置清单时为 `null`。来源出问题时先看这里。
 
 鉴权方式：请求头 `Authorization: Bearer <ADMIN_TOKEN>`，Token 采用恒定时间比较。
 
@@ -187,6 +193,9 @@ epigram/
 数据集通常放在独立仓库 **`epigram-data`** 的 `main` 分支根目录 `data.json`。
 可以配置**多个来源**（见「环境变量」的 `DATA_SOURCES`）——每个来源都使用下面这同一种格式，
 运行时会被合并成一个总池：随机抽取覆盖全部来源，搜索 / 分类 / 标签也跨来源聚合。
+
+如果希望「改一个文件就能增减来源」，可以再放一份**来源清单**（同样是 JSON 字符串数组，
+元素为上面的 `data.json` 地址），用 `DATA_MANIFEST_URL` 指向它即可，详见「自建部署教程」第 9 步。
 
 ```json
 {
@@ -219,14 +228,19 @@ KV 键设计：
 
 | 键 | 值 | 说明 |
 |:---|:---|:---|
-| `epigram:data:v1:<来源序号>` | JSON 字符串 | 该来源的数据集（序号即 `DATA_SOURCES` 数组下标） |
-| `epigram:meta:v1:<来源序号>` | JSON 字符串 | `{ loaded_at, source_url, etag? }`（`etag` 为上游 ETag，用于条件请求） |
+| `epigram:data:v1:<URL 指纹>` | JSON 字符串 | 该来源的数据集（指纹 = 来源 URL 的 FNV-1a 哈希） |
+| `epigram:meta:v1:<URL 指纹>` | JSON 字符串 | `{ loaded_at, source_url, etag? }`；`source_url` 用于校验缓存归属，`etag` 用于条件请求 |
+| `epigram:manifest:v1:<URL 指纹>` | JSON 字符串 | 来源清单缓存：`{ raw, loadedAt, etag }`（未配置清单时不产生） |
+
+键后缀由**来源 URL** 派生而不是数组下标，因此增删 / 重排来源都不会让某个来源读到别人的缓存；
+读取时还会比对 meta 里的 `source_url`，即使哈希碰撞也只会退化成一次「未命中 + 回源」。
 
 ## 环境变量
 
 | 名称 | 类型 | 默认 | 说明 |
 |:---|:---|:---|:---|
 | `DATA_SOURCES` | var | 作者维护的 `epigram-data` 仓库 | 数据集来源列表（**JSON 字符串数组**，可多个；Fork 后请换成自己的，见「自建部署教程」） |
+| `DATA_MANIFEST_URL` | var | 空（不使用清单） | 可选的**来源清单**地址：JSON 字符串数组，与 `DATA_SOURCES` 合并。改清单文件即可动态增减来源，无需重新部署 |
 | `DATA_TTL` | var | `300` | KV 缓存 TTL（秒） |
 | `ROOT_REDIRECT` | var | `/api/quotes/` | 根路径 302 重定向目标（仅接受站内绝对路径） |
 | `ENVIRONMENT` | var | `production` | 环境标识 |
@@ -296,7 +310,7 @@ npm run cf-typegen # 修改 wrangler.toml 后重新生成 worker-configuration.d
 # 单个来源
 DATA_SOURCES = '["https://raw.githubusercontent.com/<你的用户名>/my-quotes-data/main/data.json"]'
 
-# 多个来源：数组顺序即来源序号，对应 KV 键 epigram:data:v1:<序号>
+# 多个来源：顺序即优先级（仅影响超出上限时保留哪些），KV 缓存按来源 URL 独立存放
 DATA_SOURCES = '["https://raw.githubusercontent.com/<你的用户名>/poems/main/data.json", "https://raw.githubusercontent.com/<你的用户名>/sayings/main/data.json"]'
 ```
 
@@ -376,6 +390,33 @@ curl -X POST -H "Authorization: Bearer <你的 ADMIN_TOKEN>" "$BASE/api/admin/re
 只需修改你数据仓库里的 `data.json` 并提交。Worker 会在 KV 过期（`DATA_TTL`，默认 300 秒）后
 自动拉到新数据；想立即生效，调一次 `POST /api/admin/refresh`。
 
+### 9.（可选）用清单文件动态增减来源
+
+第 2 步的 `DATA_SOURCES` 是**部署期配置**——每改一次都要重新部署。如果想让「改一个文件就能增减来源」，
+可以再准备一份**来源清单**：
+
+1. 建一个内容是 JSON 字符串数组的文件（例如数据仓库里的 `sources.json`），格式与 `DATA_SOURCES` 完全一致：
+
+   ```json
+   [
+     "https://raw.githubusercontent.com/<你的用户名>/poems/main/data.json",
+     "https://raw.githubusercontent.com/<你的用户名>/sayings/main/data.json"
+   ]
+   ```
+
+2. 把它的地址填到 `DATA_MANIFEST_URL`：
+
+   ```toml
+   DATA_MANIFEST_URL = "https://raw.githubusercontent.com/<你的用户名>/my-quotes-data/main/sources.json"
+   ```
+
+之后增减来源只需改 `sources.json` 并提交，最多等 `DATA_TTL`（默认 300 秒）自动生效，
+或立刻调一次 `POST /api/admin/refresh`，**全程不用重新部署 Worker**。
+
+> 清单里的来源会与 `DATA_SOURCES` **合并**（去重后最多 20 个，超出部分丢弃并告警）。
+> 清单不可用或内容格式非法时**不会影响服务**：自动降级为「只用 `DATA_SOURCES`」或「沿用上一份合法清单」，
+> 具体原因可在 `/api/admin/stats` 的 `manifest.error` 中看到。
+
 ### 常见问题
 
 - **访问根域 404？** 根域会自动 302 到 `/api/quotes/`；若你改过 `ROOT_REDIRECT`，确认它是站内绝对路径（以单个 `/` 开头）。
@@ -452,3 +493,5 @@ curl -H "Authorization: Bearer $ADMIN_TOKEN" "$BASE/api/admin/stats"
 10. `curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" "$BASE/api/admin/refresh"` —— 返回 `200` 且 `total` 与数据仓库条数一致。
 11. 把 `data.json` 中某条记录的 `content` 置空并提交 —— 管理刷新接口应返回 `500`，且 KV 中仍是上一份合法数据。
 12. 配好两个 `DATA_SOURCES` 后 `curl "$BASE/api/admin/stats"` —— `sources` 有两项，`total` 等于两个数据集条数之和。
+13. （可选）配置 `DATA_MANIFEST_URL` 后 `curl "$BASE/api/admin/stats"` —— `manifest` 显示清单地址、解析出的来源数，
+    且清单里新增的来源已被合并进 `total`。

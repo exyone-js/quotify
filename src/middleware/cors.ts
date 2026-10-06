@@ -21,5 +21,8 @@ export function cors(): MiddlewareHandler {
     for (const [key, value] of Object.entries(CORS_HEADERS)) {
       c.res.headers.set(key, value);
     }
+    // 显式返回 undefined：Hono 只在拿到真值 Response 时才改 `c.res`，
+    // 这里必须保留 `next()` 已经写好的响应（见 hono/dist/compose.js）。
+    return undefined;
   };
 }

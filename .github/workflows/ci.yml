@@ -24,6 +24,22 @@ jobs:
       - name: 安装依赖
         run: npm ci
 
+      # `wrangler types` 的生成物不入库（见 .gitignore），每次都从 wrangler.toml 重新生成，
+      # 避免生成物与配置漂移。
+      - name: 生成 Worker 类型
+        run: npm run cf-typegen
+
+      - name: 依赖漏洞审计（生产依赖）
+        # 只审计运行时依赖：devDependencies 里的 miniflare / undici 等传递依赖
+        # 只能靠上游升级修复，已由 Dependabot 跟踪。
+        run: npm audit --omit=dev --audit-level=high
+
+      - name: 代码风格（Prettier）
+        run: npm run format:check
+
+      - name: 静态检查（ESLint）
+        run: npm run lint
+
       # 测试跑在 Workers 运行时（@cloudflare/vitest-pool-workers），无需额外服务。
       - name: 类型检查
         run: npm run typecheck

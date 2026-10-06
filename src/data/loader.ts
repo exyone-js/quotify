@@ -1,8 +1,11 @@
 import {
+  FETCH_RETRY_BASE_DELAY_MS,
+  FETCH_RETRY_COUNT,
   FETCH_TIMEOUT_MS,
   GITHUB_CACHE_TTL,
   MEMORY_CACHE_TTL_MS,
   dataKey,
+  isAllowedSourceUrl,
   limitSources,
   manifestKey,
   metaKey,
@@ -10,6 +13,7 @@ import {
   resolveBaselineSources,
   resolveDataTtl,
   resolveManifestUrl,
+  resolveSourceHosts,
 } from '../config';
 import type { Env } from '../types/env';
 import { UpstreamError } from '../utils/error';
@@ -45,6 +49,8 @@ export interface LoadResult {
   dataset: QuoteDataset;
   /** 本次是否完全未回源上游（所有来源都命中缓存）。 */
   cached: boolean;
+  /** 合并时因 id 重复而丢弃的条目数（多来源撞 id 时 > 0）。 */
+  duplicates: number;
   /** 各来源中最近一次成功加载的时间。 */
   loadedAt: number | null;
   /** 参与合并的来源。 */
@@ -140,7 +146,8 @@ function maxLoadedAt(values: readonly (number | null)[]): number | null {
 /** 取最新的 `updated_at`（ISO 时间戳可直接按字典序比较）；全为空时返回空串。 */
 function latestUpdatedAt(values: readonly string[]): string {
   const sorted = values.filter((value) => value.length > 0).sort();
-  return sorted.length > 0 ? sorted[sorted.length - 1] : '';
+  const latest = sorted[sorted.length - 1];
+  return latest ?? '';
 }
 
 /** 读取可选字符串字段：缺省合法；类型错误直接抛错（避免下游出现隐式 TypeError）。 */
@@ -148,7 +155,7 @@ function readOptionalString(
   record: Record<string, unknown>,
   key: string,
   index: number,
-  label: string
+  label: string,
 ): string | undefined {
   const value = record[key];
   if (value === undefined || value === null) return undefined;
@@ -162,9 +169,9 @@ function readOptionalString(
 function readOptionalTags(
   record: Record<string, unknown>,
   index: number,
-  label: string
+  label: string,
 ): string[] | undefined {
-  const value = record.tags;
+  const value = record['tags'];
   if (value === undefined || value === null) return undefined;
   if (!Array.isArray(value) || !value.every((tag) => typeof tag === 'string')) {
     throw new UpstreamError(`${label}格式非法：第 ${index} 条记录的 tags 必须是字符串数组。`);
@@ -187,41 +194,48 @@ export function validateDataset(input: unknown, label = '数据集'): QuoteDatas
 
   const root = input as Record<string, unknown>;
 
-  if (typeof root.version !== 'number' || !Number.isFinite(root.version)) {
+  if (typeof root['version'] !== 'number' || !Number.isFinite(root['version'])) {
     throw new UpstreamError(`${label}格式非法：version 必须是数字。`);
   }
-  if (!Array.isArray(root.quotes)) {
+  if (!Array.isArray(root['quotes'])) {
     throw new UpstreamError(`${label}格式非法：quotes 必须是数组。`);
   }
 
-  const quotes: Quote[] = root.quotes.map((item, index) => {
+  const quotes: Quote[] = root['quotes'].map((item, index) => {
     if (typeof item !== 'object' || item === null || Array.isArray(item)) {
       throw new UpstreamError(`${label}格式非法：第 ${index} 条记录不是对象。`);
     }
     const record = item as Record<string, unknown>;
 
-    const id = record.id;
+    const id = record['id'];
     if (typeof id !== 'string' || id.length === 0) {
       throw new UpstreamError(`${label}格式非法：第 ${index} 条记录缺少 id。`);
     }
-    const content = record.content;
+    const content = record['content'];
     if (typeof content !== 'string' || content.length === 0) {
       throw new UpstreamError(`${label}格式非法：第 ${index} 条记录缺少 content。`);
     }
 
+    // 可选字段逐项条件展开（而不是赋 `undefined`）：在 `exactOptionalPropertyTypes`
+    // 下这是唯一能同时满足「字段要么存在且类型正确、要么完全不存在」的写法。
+    const source = readOptionalString(record, 'source', index, label);
+    const author = readOptionalString(record, 'author', index, label);
+    const category = readOptionalString(record, 'category', index, label);
+    const tags = readOptionalTags(record, index, label);
+
     return {
       id,
       content,
-      source: readOptionalString(record, 'source', index, label),
-      author: readOptionalString(record, 'author', index, label),
-      category: readOptionalString(record, 'category', index, label),
-      tags: readOptionalTags(record, index, label),
+      ...(source !== undefined ? { source } : {}),
+      ...(author !== undefined ? { author } : {}),
+      ...(category !== undefined ? { category } : {}),
+      ...(tags !== undefined ? { tags } : {}),
     };
   });
 
   return {
-    version: root.version,
-    updated_at: typeof root.updated_at === 'string' ? root.updated_at : '',
+    version: root['version'],
+    updated_at: typeof root['updated_at'] === 'string' ? root['updated_at'] : '',
     quotes,
   };
 }
@@ -249,7 +263,11 @@ interface ParsedMeta {
 function parseMeta(metaRaw: string | null): ParsedMeta {
   if (metaRaw === null) return { loadedAt: null, etag: null, sourceUrl: null };
   try {
-    const { loaded_at: loadedAt, etag, source_url: sourceUrl } = JSON.parse(metaRaw) as Partial<DatasetMeta>;
+    const {
+      loaded_at: loadedAt,
+      etag,
+      source_url: sourceUrl,
+    } = JSON.parse(metaRaw) as Partial<DatasetMeta>;
     return {
       loadedAt: typeof loadedAt === 'number' ? loadedAt : null,
       etag: typeof etag === 'string' && etag.length > 0 ? etag : null,
@@ -278,7 +296,7 @@ async function readSnapshot(env: Env, url: string): Promise<SourceSnapshot | nul
     const meta = parseMeta(metaRaw);
     if (meta.sourceUrl !== null && meta.sourceUrl !== url) {
       console.warn(
-        `[quotify] 缓存来源不匹配（期望 ${url}，实际 ${meta.sourceUrl}），忽略该缓存并回源。`
+        `[quotify] 缓存来源不匹配（期望 ${url}，实际 ${meta.sourceUrl}），忽略该缓存并回源。`,
       );
       return null;
     }
@@ -339,13 +357,79 @@ async function fetchUpstream(url: string, etag: string | null): Promise<Upstream
   }
 }
 
+/** 等待指定毫秒（用于重试退避）。 */
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * 判断一次失败是否值得重试。
+ *
+ * 只有「超时 / 网络错误 / 5xx / 429」才重试：这些是瞬时抖动，重试能显著提高
+ * GitHub 限流等场景下的成功率；4xx（404 / 400 等）是确定性失败，重试只会拖慢响应。
+ * `fetchUpstream` 把状态码写进了错误消息（`返回 502。`），这里据此判断。
+ */
+function shouldRetry(message: string): boolean {
+  const status = /返回\s+(\d{3})/.exec(message);
+  if (status !== null) {
+    const code = Number(status[1]);
+    return code === 429 || code >= 500;
+  }
+  // 拿不到状态码 = 超时或网络错误，属于可重试的瞬时故障。
+  return true;
+}
+
+/**
+ * 带重试的上游请求，退避为指数型（120ms、240ms）。
+ * 重试次数用尽后抛出最后一次的错误，交由上层的「单来源容错」处理。
+ */
+async function fetchUpstreamWithRetry(url: string, etag: string | null): Promise<UpstreamResponse> {
+  let lastError: unknown = null;
+
+  for (let attempt = 0; attempt <= FETCH_RETRY_COUNT; attempt += 1) {
+    try {
+      return await fetchUpstream(url, etag);
+    } catch (err) {
+      lastError = err;
+      const message = err instanceof Error ? err.message : String(err);
+      if (!shouldRetry(message) || attempt === FETCH_RETRY_COUNT) break;
+      console.warn(`[quotify] 上游 ${url} 第 ${attempt + 1} 次请求失败，准备重试：${message}`);
+      await sleep(FETCH_RETRY_BASE_DELAY_MS * 2 ** attempt);
+    }
+  }
+
+  throw lastError instanceof Error ? lastError : new UpstreamError(String(lastError));
+}
+
+/**
+ * 同一 isolate 内的回源去重（single-flight）。
+ *
+ * 冷缓存时若没有它，N 个并发请求会对上游发起 N 次全量回源（惊群），
+ * 最多可达 N × 20 个来源。这里让并发请求共享同一个 Promise。
+ * 强制刷新（force）不参与复用，以保证「刷新」一定要真正回源。
+ */
+const inflight = new Map<string, Promise<LoadedSource>>();
+
+async function loadSourceDeduped(env: Env, url: string, force: boolean): Promise<LoadedSource> {
+  if (force) return loadSource(env, url, true);
+
+  const pending = inflight.get(url);
+  if (pending !== undefined) return pending;
+
+  const task = loadSource(env, url, false).finally(() => {
+    inflight.delete(url);
+  });
+  inflight.set(url, task);
+  return task;
+}
+
 /** 回写某个来源的数据集与元信息（同时重置 TTL）。 */
 async function writeCache(
   env: Env,
   url: string,
   raw: string,
   loadedAt: number,
-  etag: string | null
+  etag: string | null,
 ): Promise<void> {
   const ttl = resolveDataTtl(env);
   const meta: DatasetMeta = { loaded_at: loadedAt, source_url: url };
@@ -375,7 +459,7 @@ async function loadSource(env: Env, url: string, force: boolean): Promise<Loaded
     };
   }
 
-  const upstream = await fetchUpstream(url, snapshot?.etag ?? null);
+  const upstream = await fetchUpstreamWithRetry(url, snapshot?.etag ?? null);
 
   if (upstream.status === 304) {
     if (snapshot === null) {
@@ -433,7 +517,7 @@ async function writeManifestRecord(
   key: string,
   raw: string,
   loadedAt: number,
-  etag: string | null
+  etag: string | null,
 ): Promise<void> {
   const record: ManifestRecord = { raw, loadedAt, etag };
   await env.CACHE.put(key, JSON.stringify(record), { expirationTtl: resolveDataTtl(env) });
@@ -446,14 +530,26 @@ async function writeManifestRecord(
  * 「沿用上一份合法清单 / 不加额外来源」，而不是让整个服务不可用；
  * 失败原因会记录到日志与 `manifest.error`，不会静默。
  */
-function parseManifestUrls(raw: string, url: string): string[] | null {
+function parseManifestUrls(raw: string, url: string, hosts: readonly string[]): string[] | null {
+  let parsed: string[];
   try {
-    return parseSourceList(raw, `清单文件 ${url}`);
+    parsed = parseSourceList(raw, `清单文件 ${url}`);
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err);
     console.error(`[quotify] 清单文件格式非法（${url}）：${reason}`);
     return null;
   }
+
+  // 清单是运行期数据，可能被协作者误改、也可能被中间人篡改：
+  // 不允许的地址直接丢弃（只影响这一个来源，服务整体仍然可用）。
+  const allowed = parsed.filter((item) => isAllowedSourceUrl(item, hosts));
+  const rejected = parsed.length - allowed.length;
+  if (rejected > 0) {
+    console.error(
+      `[quotify] 清单文件 ${url} 中有 ${rejected} 个来源地址不被允许（必须是 https，且命中 DATA_SOURCE_HOSTS 白名单），已忽略。`,
+    );
+  }
+  return allowed;
 }
 
 /**
@@ -465,16 +561,17 @@ function parseManifestUrls(raw: string, url: string): string[] | null {
 async function loadManifest(
   env: Env,
   force: boolean,
-  allowFetch = true
+  allowFetch = true,
 ): Promise<ManifestResult | null> {
   const url = resolveManifestUrl(env);
   if (url === null) return null;
 
   const key = manifestKey(url);
   const record = await readManifestRecord(env, key);
+  const hosts = resolveSourceHosts(env);
   /** 用缓存里的清单内容兜底：没有缓存就是「不加额外来源」。 */
   const cachedUrls = (): string[] =>
-    record === null ? [] : (parseManifestUrls(record.raw, url) ?? []);
+    record === null ? [] : (parseManifestUrls(record.raw, url, hosts) ?? []);
   const done = (urls: string[], error: string | null): ManifestResult => ({
     urls,
     state: { url, count: urls.length, error },
@@ -488,7 +585,7 @@ async function loadManifest(
   }
 
   try {
-    const upstream = await fetchUpstream(url, record?.etag ?? null);
+    const upstream = await fetchUpstreamWithRetry(url, record?.etag ?? null);
 
     if (upstream.status === 304 && record !== null) {
       await writeManifestRecord(
@@ -496,13 +593,13 @@ async function loadManifest(
         key,
         record.raw,
         record.loadedAt > 0 ? record.loadedAt : Date.now(),
-        record.etag
+        record.etag,
       );
       return done(cachedUrls(), null);
     }
 
     const raw = upstream.text ?? '';
-    const parsed = parseManifestUrls(raw, url);
+    const parsed = parseManifestUrls(raw, url, hosts);
     if (parsed === null) {
       // 内容非法：保留上一份合法清单，不回写 KV。
       return done(cachedUrls(), '清单文件格式非法，已沿用上一份缓存');
@@ -528,19 +625,21 @@ async function loadAggregate(env: Env, baseline: string[], force: boolean): Prom
   const urls = limitSources([...baseline, ...(manifest?.urls ?? [])]);
 
   if (urls.length === 0) {
-    throw new UpstreamError('未解析到任何数据来源：请检查 DATA_SOURCES 与 DATA_MANIFEST_URL 配置。');
+    throw new UpstreamError(
+      '未解析到任何数据来源：请检查 DATA_SOURCES 与 DATA_MANIFEST_URL 配置。',
+    );
   }
 
   const outcomes = await Promise.all(
     urls.map(async (url): Promise<SourceOutcome> => {
       try {
-        return { state: await loadSource(env, url, force), failure: null };
+        return { state: await loadSourceDeduped(env, url, force), failure: null };
       } catch (err) {
         const reason = err instanceof Error ? err.message : String(err);
         console.error(`[quotify] 数据来源加载失败（${url}）：${reason}`);
         return { state: null, failure: { url, error: reason } };
       }
-    })
+    }),
   );
 
   const loaded: LoadedSource[] = [];
@@ -552,23 +651,40 @@ async function loadAggregate(env: Env, baseline: string[], force: boolean): Prom
 
   if (loaded.length === 0) {
     // 单来源时直接抛出原始错误，避免套一层「全部失败」前缀造成信息冗余。
-    if (urls.length === 1 && failures.length === 1) {
-      throw new UpstreamError(failures[0].error);
+    const only = failures[0];
+    if (urls.length === 1 && failures.length === 1 && only !== undefined) {
+      throw new UpstreamError(only.error);
     }
     const detail = failures.map((item) => `${item.url}：${item.error}`).join('；');
     throw new UpstreamError(`全部 ${urls.length} 个数据源均加载失败。${detail}`);
   }
 
-  // 合并：条目拼接成总池，version / updated_at 取各来源的「最大值」作为聚合标识。
+  // 合并：条目拼接成总池，并按 id 去重（靠前来源优先）。
+  // 不去重的话，多来源撞 id 时 `?limit=N` 可能返回重复条目，计数也会失真。
+  const byId = new Map<string, Quote>();
+  let duplicates = 0;
+  for (const quote of loaded.flatMap((item) => item.dataset.quotes)) {
+    if (byId.has(quote.id)) {
+      duplicates += 1;
+      continue;
+    }
+    byId.set(quote.id, quote);
+  }
+  if (duplicates > 0) {
+    console.warn(`[quotify] 合并时丢弃了 ${duplicates} 条重复 id 的条目（保留靠前的来源）。`);
+  }
+
   const dataset: QuoteDataset = {
+    // version / updated_at 取各来源的「最大值」作为聚合标识。
     version: Math.max(...loaded.map((item) => item.dataset.version)),
     updated_at: latestUpdatedAt(loaded.map((item) => item.dataset.updated_at)),
-    quotes: loaded.flatMap((item) => item.dataset.quotes),
+    quotes: [...byId.values()],
   };
 
   return {
     dataset,
     cached: loaded.every((item) => item.cached),
+    duplicates,
     loadedAt: maxLoadedAt(loaded.map((item) => item.loadedAt)),
     sources: loaded.map(({ url, total, loadedAt, cached }) => ({ url, total, loadedAt, cached })),
     failures,
@@ -596,7 +712,9 @@ export async function loadDatasetWithMeta(env: Env): Promise<LoadResult> {
   const configKey = configKeyOf(baseline, resolveManifestUrl(env));
 
   const hot = readMemory(configKey);
-  if (hot !== null) return { ...hot, cached: true };
+  // 原样返回：热缓存里记录的 cached / failures 就是上一次真实加载的结果。
+  // 之前这里会无条件覆写成 cached:true，把回源过的来源与失败项一并掩盖掉。
+  if (hot !== null) return hot;
 
   return writeMemory(await loadAggregate(env, baseline, false), configKey);
 }
@@ -607,38 +725,56 @@ export async function loadDataset(env: Env): Promise<QuoteDataset> {
   return dataset;
 }
 
+/** 缓存就绪状态：`warm` 全部就绪 / `degraded` 部分就绪 / `cold` 尚无可用缓存。 */
+export type CacheState = 'warm' | 'degraded' | 'cold';
+
 /** 只读缓存状态（不触发回源），供健康检查使用；优先命中热缓存以避免重复解析。 */
 export async function peekCache(env: Env): Promise<{
   cached: boolean;
+  state: CacheState;
   loadedAt: number | null;
   total: number;
   sourcesLoaded: number;
   sourcesTotal: number;
+  /** 清单是否已缓存：冷启动时连来源都枚举不出来，`sourcesTotal` 会是 0。 */
+  manifestCached: boolean;
 }> {
   const baseline = resolveBaselineSources(env);
+  const manifestUrl = resolveManifestUrl(env);
 
-  const hot = readMemory(configKeyOf(baseline, resolveManifestUrl(env)));
+  const hot = readMemory(configKeyOf(baseline, manifestUrl));
   if (hot !== null) {
     return {
       cached: true,
+      state: hot.failures.length > 0 ? 'degraded' : 'warm',
       loadedAt: hot.loadedAt,
       total: hot.dataset.quotes.length,
       sourcesLoaded: hot.sources.length,
       sourcesTotal: hot.sources.length + hot.failures.length,
+      manifestCached: hot.manifest !== null,
     };
   }
 
   // 冷路径：清单与各来源都只读 KV（并发），不触发任何回源。
   const manifest = await loadManifest(env, false, false);
+  const manifestCached = manifest !== null && manifest.urls.length > 0;
   const urls = limitSources([...baseline, ...(manifest?.urls ?? [])]);
   const snapshots = await Promise.all(urls.map((url) => readSnapshot(env, url)));
   const available = snapshots.filter((item): item is SourceSnapshot => item !== null);
 
+  // 区分「冷启动还没加载过」与「配置了来源但一个都加载不出来」：
+  // 只有后者才是真正的故障，前者只是 isolate 刚起来。
+  let state: CacheState = 'cold';
+  if (urls.length > 0 && available.length === urls.length) state = 'warm';
+  else if (available.length > 0) state = 'degraded';
+
   return {
     cached: available.length > 0,
+    state,
     loadedAt: maxLoadedAt(available.map((item) => item.loadedAt)),
     total: available.reduce((sum, item) => sum + item.dataset.quotes.length, 0),
     sourcesLoaded: available.length,
     sourcesTotal: urls.length,
+    manifestCached,
   };
 }

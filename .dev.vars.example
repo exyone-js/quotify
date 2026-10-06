@@ -1,0 +1,9 @@
+# 复制成本文件（.dev.vars，已在 .gitignore 中）后填入你自己的口令即可本地开发：
+#   cp .dev.vars.example .dev.vars
+#
+# 生产环境不要用文件注入，请执行：
+#   npx wrangler secret put ADMIN_TOKEN
+#
+# 未配置时管理接口（/api/admin/*）会直接返回 500 并打告警，
+# 这是刻意的：宁可禁用，也不能带着一个公开已知的默认值上线。
+ADMIN_TOKEN=change-me

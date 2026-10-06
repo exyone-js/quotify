@@ -11,9 +11,19 @@
     "noUnusedParameters": true,
     "noFallthroughCasesInSwitch": true,
     "noImplicitOverride": true,
+    // 下标访问一律视为可能越界：数组 / 索引签名取值都会带上 `| undefined`。
+    "noUncheckedIndexedAccess": true,
+    // 函数只要有一条路径返回值，就必须在所有路径上返回值。
+    "noImplicitReturns": true,
+    // 索引签名字段只能用 `obj["key"]` 访问，避免把动态键误当成确定存在的属性。
+    "noPropertyAccessFromIndexSignature": true,
+    // 可选属性不允许被显式赋值为 `undefined`：字段要么存在且类型正确，要么完全不存在。
+    "exactOptionalPropertyTypes": true,
     "noEmit": true,
     "isolatedModules": true,
     "verbatimModuleSyntax": true,
+    // 允许 `import ... from './x.ts'`：Vite 的原生配置加载器要求显式扩展名。
+    "allowImportingTsExtensions": true,
     "esModuleInterop": true,
     "resolveJsonModule": true,
     "skipLibCheck": true,

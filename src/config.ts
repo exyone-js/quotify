@@ -20,7 +20,7 @@ export const MAX_DATA_SOURCES = 20;
  * 哈希存在碰撞可能，但读取缓存时会比对 meta 里的 `source_url`，
  * 真碰撞只会退化成一次「未命中 + 回源」，不会返回错数据。
  */
-function fingerprint(input: string): string {
+export function fingerprint(input: string): string {
   let hash = 0x811c9dc5;
   for (let i = 0; i < input.length; i += 1) {
     hash ^= input.charCodeAt(i);
@@ -62,17 +62,36 @@ export const DEFAULT_DATA_SOURCES: readonly string[] = [];
 /** 缓存默认 TTL：300 秒。 */
 export const DEFAULT_DATA_TTL = 300;
 
+/**
+ * KV `expirationTtl` 的合法区间（Cloudflare 要求至少 60 秒）。
+ *
+ * 越界的配置不会「悄悄生效」，而是夹紧到边界并打告警：
+ * 低于下限时 `CACHE.put` 会直接抛错，进而让所有来源加载失败、全站 500。
+ */
+export const MIN_DATA_TTL = 60;
+export const MAX_DATA_TTL = 31_536_000;
+
 /** 进程内热缓存 TTL：60 秒。用于避免每个请求都重复读 KV 并全量解析数据集。 */
 export const MEMORY_CACHE_TTL_MS = 60_000;
 
 /** 外部 fetch 超时时间：5 秒。 */
 export const FETCH_TIMEOUT_MS = 5000;
 
+/** 回源失败后的重试次数与退避基数：只在超时 / 网络错误 / 5xx 时重试，4xx 直接失败。 */
+export const FETCH_RETRY_COUNT = 2;
+export const FETCH_RETRY_BASE_DELAY_MS = 120;
+
 /** 回源请求在 Cloudflare 边缘缓存中的 TTL：60 秒（缓解 GitHub 限流）。 */
 export const GITHUB_CACHE_TTL = 60;
 
 /** 逗号分隔参数允许的最大取值个数，避免超长参数放大过滤开销。 */
 export const MAX_CSV_VALUES = 50;
+
+/** 单个参数取值的最大字符数，避免超长关键词把子串匹配放大成 O(n·m)。 */
+export const MAX_PARAM_LENGTH = 100;
+
+/** 分页偏移上限：超过它几乎一定是误用，且会白扫一遍结果集。 */
+export const MAX_OFFSET = 10_000;
 
 /** 内容稳定的派生接口（分类 / 标签）的浏览器 / CDN 缓存时长：1 小时。 */
 export const CATALOG_CACHE_MAX_AGE = 3600;
@@ -122,15 +141,24 @@ export function parseSourceList(raw: string, label: string): string[] {
 /**
  * 读取基线来源（部署期配置的 `DATA_SOURCES`）。
  *
- * 这是「配置」而非「运行期数据」，所以非法时**直接抛错**而不是静默回退，
- * 避免「配置写错了却毫无察觉」。未配置或显式 `[]` 都表示不设静态来源
- * （此时来源全部来自清单文件，见 `resolveManifestUrl`）。
+ * 配置非法时**降级为空列表**而不是抛错：来源还可能全部来自清单文件（见
+ * `resolveManifestUrl`），一个配置笔误不该让整个 API 不可用。
+ * 降级不会静默——错误会打到日志，并在清单也没解析出来源时
+ * 由 `loadAggregate` 抛出「未解析到任何数据来源」。
+ *
+ * 未配置或显式 `[]` 都表示不设静态来源。
  */
 export function resolveBaselineSources(env: Env): string[] {
   const raw = env.DATA_SOURCES?.trim();
   if (!raw) return [...DEFAULT_DATA_SOURCES];
 
-  return parseSourceList(raw, 'DATA_SOURCES');
+  try {
+    return parseSourceList(raw, 'DATA_SOURCES');
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    console.error(`[quotify] DATA_SOURCES 解析失败，已降级为「不设静态来源」：${reason}`);
+    return [...DEFAULT_DATA_SOURCES];
+  }
 }
 
 /**
@@ -153,27 +181,86 @@ export function limitSources(urls: readonly string[]): string[] {
   if (unique.length <= MAX_DATA_SOURCES) return unique;
 
   console.warn(
-    `[quotify] 数据来源过多（${unique.length} 个），只取前 ${MAX_DATA_SOURCES} 个（见 MAX_DATA_SOURCES）。`
+    `[quotify] 数据来源过多（${unique.length} 个），只取前 ${MAX_DATA_SOURCES} 个（见 MAX_DATA_SOURCES）。`,
   );
   return unique.slice(0, MAX_DATA_SOURCES);
 }
 
 /**
+ * 站内绝对路径白名单。
+ *
+ * 只放行「以单个 `/` 开头、且后续每段都由 URL 安全字符构成」的路径，因此：
+ * - `//evil.com`（协议相对地址）→ 拒绝；
+ * - `/\evil.com`（反斜杠）→ 拒绝：浏览器会把 `\` 规范化成 `/`，从而绕过 `//` 检查；
+ * - 控制字符 / 空白 / `?` → 拒绝，避免反射出畸形 Location 头。
+ */
+const SAFE_PATH_PATTERN =
+  /^\/[A-Za-z0-9\-._~!$&'()*+,;=:@%]+(?:\/[A-Za-z0-9\-._~!$&'()*+,;=:@%]*)*$/;
+
+/** 重定向目标的最大长度，避免异常配置反射进 Location 头。 */
+const MAX_ROOT_REDIRECT_LENGTH = 200;
+
+/**
  * 读取生效的根路径重定向目标。
  *
- * 只接受站内绝对路径（以 `/` 开头且不以 `//` 开头），否则回退到默认值：
- * 避免配置被写成外链时形成开放重定向（Open Redirect）。
+ * 只接受站内绝对路径，否则回退到默认值：避免配置被写成外链时形成开放重定向（Open Redirect）。
  */
 export function resolveRootRedirect(env: Env): string {
   const target = env.ROOT_REDIRECT?.trim();
-  if (!target || !target.startsWith('/') || target.startsWith('//')) {
+  if (!target || target.length > MAX_ROOT_REDIRECT_LENGTH || !SAFE_PATH_PATTERN.test(target)) {
     return DEFAULT_ROOT_REDIRECT;
   }
   return target;
 }
 
-/** 读取生效的缓存 TTL（秒），非法值回退到默认值。 */
+/**
+ * 读取生效的缓存 TTL（秒）。
+ *
+ * 非法值（非数字 / 非正数 / NaN）回退到默认值；合法但越界的值**夹紧**到
+ * `[MIN_DATA_TTL, MAX_DATA_TTL]` 并打告警——低于 KV 下限会让写入直接抛错。
+ */
 export function resolveDataTtl(env: Env): number {
   const ttl = Number(env.DATA_TTL);
-  return Number.isFinite(ttl) && ttl > 0 ? Math.floor(ttl) : DEFAULT_DATA_TTL;
+  if (!Number.isFinite(ttl) || ttl <= 0) return DEFAULT_DATA_TTL;
+
+  const seconds = Math.floor(ttl);
+  if (seconds < MIN_DATA_TTL) {
+    console.warn(`[quotify] DATA_TTL=${seconds} 低于 KV 下限，已夹紧为 ${MIN_DATA_TTL} 秒。`);
+    return MIN_DATA_TTL;
+  }
+  if (seconds > MAX_DATA_TTL) {
+    console.warn(`[quotify] DATA_TTL=${seconds} 超过上限，已夹紧为 ${MAX_DATA_TTL} 秒。`);
+    return MAX_DATA_TTL;
+  }
+  return seconds;
+}
+
+/** 读取可选的来源主机白名单（逗号分隔；未配置表示不限制主机）。 */
+export function resolveSourceHosts(env: Env): string[] {
+  const raw = env.DATA_SOURCE_HOSTS?.trim();
+  if (!raw) return [];
+  return raw
+    .split(',')
+    .map((host) => host.trim().toLowerCase())
+    .filter((host) => host.length > 0);
+}
+
+/**
+ * 判断一个来源地址是否允许被加载。
+ *
+ * 来源清单属于「运行期数据」（可能被协作者改动、也可能被中间人篡改），
+ * 因此清单里解析出的地址必须过这一关：
+ * - 协议必须是 `https:`：禁止 `http://` 明文与 `file:` / `data:` 等；
+ * - 若配置了 `DATA_SOURCE_HOSTS`，主机必须命中白名单（防 SSRF 到内网 / 任意站点）。
+ */
+export function isAllowedSourceUrl(url: string, hosts: readonly string[]): boolean {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return false;
+  }
+  if (parsed.protocol !== 'https:') return false;
+  if (hosts.length > 0 && !hosts.includes(parsed.hostname.toLowerCase())) return false;
+  return true;
 }

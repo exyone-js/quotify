@@ -1,7 +1,8 @@
 # Quotify · 引语 API
 
 > **Quotify**（取自 `quote`）是一个仿「一言（Hitokoto）」的引语 API 实现，中文名 **引语**。
-> 功能定位参考一言（随机返回一条或多条引语），但接口约定自成一套，**并非** Hitokoto 的兼容实现。
+> 功能定位参考一言（随机返回一条或多条引语），但原生接口约定自成一套，**并非** Hitokoto 的兼容实现。
+> 需要零改动迁移既有 Hitokoto 客户端时，可用 `/v1/hitokoto` 兼容层（见「Hitokoto 兼容层」）。
 
 运行在 **Cloudflare Workers** 上的生产级引语 API：随机返回引语，并支持分类 / 标签筛选与关键词搜索。
 数据源不是数据库，而是 **一个或多个 `data.json`**（可配置多个不同来源，随机抽取时合并成一个总池）；
@@ -14,8 +15,10 @@
 - 数据源：默认由 `DATA_MANIFEST_URL` 指向的**来源清单**提供（改清单文件即可动态增减来源，**无需重新部署**），
   可另配 `DATA_SOURCES` 作静态兜底；每个来源独立缓存、独立容错
 - 缓存：Cloudflare KV（每个来源各缓存一份，TTL 300 秒）
-- 限流：Cloudflare Rate Limiting Binding（公开 60 次/分钟/IP，管理 10 次/分钟/IP）
+- 限流：Cloudflare Rate Limiting Binding（公开 60 次/分钟/IP，管理 10 次/分钟/IP，
+  `/` 与 `/api/health` 300 次/分钟/IP）
 - 测试：Vitest + `@cloudflare/vitest-pool-workers`（测试真实运行在 Workers 运行时中）
+- 工程化：ESLint + Prettier + TypeScript 严格模式（含 `noUncheckedIndexedAccess`），CI 全量校验
 - bundle：约 93 KiB（gzip 约 23 KiB），远低于 1 MB 上限
 
 ## 架构
@@ -42,7 +45,8 @@ API 响应
 ```
 
 > 热缓存以 isolate 为单位，只用于省掉「读 KV + 全量解析」，不承担一致性保证；
-> 管理端 `/refresh` 会清掉当前 isolate 的副本。多 isolate 下数据最多陈旧一个热缓存 TTL（60s）。
+> 管理端 `/refresh` 会用「重新加载后的结果」**覆盖**当前 isolate 的副本。
+> 多 isolate 下数据最多陈旧一个热缓存 TTL（60s）。
 
 ## 目录结构
 
@@ -50,41 +54,58 @@ API 响应
 quotify/
 ├── src/
 │   ├── index.ts              # Worker 入口：安全头、CORS、根域重定向、健康检查、路由挂载、统一错误处理
-│   ├── config.ts             # 常量、KV 键（URL 指纹）、来源列表解析、默认配置
+│   ├── config.ts             # 常量、KV 键（URL 指纹）、来源列表解析、TTL 夹紧、重定向与来源白名单校验
 │   ├── routes/
 │   │   ├── quotes.ts         # 公开查询路由
-│   │   └── admin.ts          # 管理路由
+│   │   ├── admin.ts          # 管理路由
+│   │   └── compat.ts         # Hitokoto 兼容层（/v1/hitokoto：字段映射 + 分类码 + JSONP）
 │   ├── data/
 │   │   ├── loader.ts         # 多来源懒加载 / 合并 + 各来源独立 KV 与条件请求 + 数据校验
+│   │   │                     # （含 single-flight 回源去重、失败重试、按 id 去重）
 │   │   ├── store.ts          # 内存查询（filter / search / random / paginate）+ 派生索引记忆化
 │   │   └── types.ts          # Quote / QuoteDataset 类型
 │   ├── middleware/
 │   │   ├── security.ts       # 通用安全响应头
 │   │   ├── cors.ts           # CORS + OPTIONS 预检
 │   │   ├── auth.ts           # 管理接口 Bearer 鉴权（恒定时间比较）
-│   │   └── rateLimit.ts      # 速率限制
+│   │   └── rateLimit.ts      # 速率限制（公开 / 管理 / 宽松三档）
 │   ├── utils/
-│   │   ├── response.ts       # 统一响应格式 + 缓存头 / 304
+│   │   ├── response.ts       # 统一响应格式 + 缓存头 / 304 / ETag 宽松匹配
 │   │   └── error.ts          # 错误类型 + 参数校验
 │   └── types/
-│       └── env.ts            # 应用面向的 Env 绑定视图
-├── tests/api.test.ts         # 集成 / 单元测试
-├── .github/workflows/ci.yml  # CI：typecheck + test
-├── data/data.json            # 示例数据集（推送到 quotify-data 仓库）
+│       └── env.ts            # 应用面向的 Env 绑定视图（唯一契约）
+├── tests/
+│   ├── api.test.ts           # 端到端集成测试
+│   ├── store.test.ts         # store 纯函数单测
+│   ├── config.test.ts        # 配置解析与边界单测
+│   ├── hardening.test.ts     # 安全 / 缓存 / 回源容错加固项
+│   ├── compat.test.ts        # Hitokoto 兼容层
+│   ├── data.test.ts          # 示例数据集校验
+│   └── test-token.ts         # 测试用 ADMIN_TOKEN（与 vitest.config.ts 共用）
+├── data/
+│   ├── data.json             # 示例数据集（推送到 quotify-data 仓库）
+│   └── schema.json           # 数据集 JSON Schema（供外部工具复用）
+├── .github/workflows/ci.yml  # CI：类型生成 + 依赖审计 + 风格 + 静态检查 + typecheck + test
+├── .github/dependabot.yml    # 依赖自动升级
+├── eslint.config.js / .prettierrc.json / .prettierignore
+├── .dev.vars.example         # 本地开发密钥模板
 ├── wrangler.toml
 ├── vitest.config.ts
 ├── tsconfig.json
 └── package.json
 ```
 
+> `worker-configuration.d.ts` 由 `npm run cf-typegen` 生成、已在 `.gitignore` 中：
+> 应用代码只依赖 `src/types/env.ts` 这份契约，避免生成物与配置漂移。
+
 ## 命名约定
 
 项目只用两个词，各司其职，避免同一概念出现多种叫法：
 
-| 层 | 用词 | 示例 |
-|:---|:---|:---|
-| 公开契约 + 数据模型 | `quote` | `GET /api/quotes`、数据集字段 `quotes`、类型 `Quote` / `QuoteDataset` |
-| 项目 / 品牌标识 | `quotify` | 包名 `quotify-api`、KV 键前缀 `quotify:`、`service: "quotify"` |
+| 层                  | 用词      | 示例                                                                  |
+| :------------------ | :-------- | :-------------------------------------------------------------------- |
+| 公开契约 + 数据模型 | `quote`   | `GET /api/quotes`、数据集字段 `quotes`、类型 `Quote` / `QuoteDataset` |
+| 项目 / 品牌标识     | `quotify` | 包名 `quotify-api`、KV 键前缀 `quotify:`、`service: "quotify"`        |
 
 公开接口、数据集字段与代码类型统一使用通用的 `quote`：
 
@@ -106,9 +127,15 @@ quotify/
 ```
 
 状态码约定：`200` 成功 / `400` 参数错误 / `401` 未授权 / `404` 未找到 / `429` 限流 / `500` 服务器错误。
-所有响应都带 `Access-Control-Allow-Origin: *`（含错误响应），以及安全头
-`X-Content-Type-Options: nosniff` 与 `Referrer-Policy: no-referrer`。
-路径末尾的斜杠会被忽略：`/api/quotes` 与 `/api/quotes/` 等价（Hono 以 `strict: false` 启动）。
+
+- 所有响应都带 `Access-Control-Allow-Origin: *`（含错误响应），以及安全头
+  `X-Content-Type-Options: nosniff`、`Referrer-Policy: no-referrer`、
+  `X-Frame-Options: DENY`、`Cross-Origin-Resource-Policy: cross-origin`。
+- **除了**分类 / 标签这类内容稳定的派生接口，其余响应一律带 `Cache-Control: no-store`：
+  随机接口一旦被中间代理缓存，所有用户就会看到同一条引语。
+- 路径末尾的斜杠会被忽略：`/api/quotes` 与 `/api/quotes/` 等价（Hono 以 `strict: false` 启动）。
+- 参数取值有长度与格式上限：`limit` / `offset` 只接受十进制整数（`0x10`、`1e3` 会被拒绝），
+  `offset` 上限 10000，`q` / `category` / `tag` 单个取值上限 100 个字符。
 
 ### `GET /` — 根域自动重定向
 
@@ -118,16 +145,17 @@ quotify/
 
 - 目标可通过环境变量 `ROOT_REDIRECT` 配置（默认 `/api/quotes/`）。
 - 出于安全考虑只接受站内绝对路径（以单个 `/` 开头），配置成外链等非法值会回退到默认值，避免开放重定向。
+  反斜杠（`/\evil.com`）与控制字符同样被拒绝——浏览器会把 `\` 规范化成 `/`，从而绕过 `//` 检查。
 - `HEAD /` 与 `GET /` 行为一致（Hono 会按 GET 处理并剥离响应体）。
 
 ### `GET /api/quotes` — 随机一言
 
-| 参数 | 类型 | 默认 | 说明 |
-|:---|:---|:---|:---|
-| `category` | string | 无 | 分类，多个用逗号分隔（OR），最多 50 个 |
-| `tag` | string | 无 | 标签，多个用逗号分隔（OR），最多 50 个 |
-| `limit` | number | `1` | 返回数量，1–20（超出上限收敛到 20） |
-| `format` | string | `json` | `json` 或 `text` |
+| 参数       | 类型   | 默认   | 说明                                   |
+| :--------- | :----- | :----- | :------------------------------------- |
+| `category` | string | 无     | 分类，多个用逗号分隔（OR），最多 50 个 |
+| `tag`      | string | 无     | 标签，多个用逗号分隔（OR），最多 50 个 |
+| `limit`    | number | `1`    | 返回数量，1–20（超出上限收敛到 20）    |
+| `format`   | string | `json` | `json` 或 `text`                       |
 
 `data` 始终为数组。`format=text` 时直接返回纯文本 `content`（多条以换行分隔），
 `Content-Type: text/plain; charset=utf-8`。
@@ -135,13 +163,13 @@ quotify/
 
 ### `GET /api/quotes/search` — 关键词搜索
 
-| 参数 | 类型 | 默认 | 说明 |
-|:---|:---|:---|:---|
-| `q` | string | **必填** | 关键词，最少 1 个字符 |
-| `category` | string | 无 | 分类过滤，最多 50 个 |
-| `tag` | string | 无 | 标签过滤，最多 50 个 |
-| `limit` | number | `10` | 1–50 |
-| `offset` | number | `0` | 偏移量，≥ 0 |
+| 参数       | 类型   | 默认     | 说明                  |
+| :--------- | :----- | :------- | :-------------------- |
+| `q`        | string | **必填** | 关键词，最少 1 个字符 |
+| `category` | string | 无       | 分类过滤，最多 50 个  |
+| `tag`      | string | 无       | 标签过滤，最多 50 个  |
+| `limit`    | number | `10`     | 1–50                  |
+| `offset`   | number | `0`      | 偏移量，≥ 0           |
 
 在 `content` / `author` / `source` 中做**大小写不敏感**的子串匹配。
 `category` 与 `tag` 之间是 **AND**，同一参数内多个值是 **OR**。
@@ -150,8 +178,13 @@ quotify/
 
 返回去重、按拼音排序的字符串数组。
 
-结果在同一数据集内稳定，因此响应带 `Cache-Control: public, max-age=3600` 与 `ETag`；
-客户端带 `If-None-Match` 再次请求时返回 **304**（无正文），并同样带 CORS 与安全头。
+结果在同一数据集内稳定，因此响应带 `Cache-Control: public, max-age=<min(3600, DATA_TTL)>`（默认 `300`）
+与 `ETag`；客户端带 `If-None-Match` 再次请求时返回 **304**（无正文），并同样带 CORS 与安全头。
+缓存时长与数据集 TTL 取小，避免客户端缓存得比服务端刷新周期还久。
+
+`ETag` 由**全量内容**哈希而来（而不是只看 `version` / `updated_at` / 条数），
+因此维护者改了分类或标签、却没更新 `updated_at`，ETag 也会变化，不会一直返回过期目录。
+`If-None-Match` 采用宽松匹配：容忍 `W/` 前缀差异、多值列表与代理追加的 `-gzip` 之类后缀。
 
 ### `GET /api/health` — 健康检查
 
@@ -161,10 +194,30 @@ quotify/
 {
   "status": 200,
   "message": "ok.",
-  "data": { "service": "quotify", "environment": "production", "cached": true, "cache_loaded_at": 1759000000000, "total": 1204, "sources": { "loaded": 2, "total": 2 } },
+  "data": {
+    "service": "quotify",
+    "environment": "production",
+    "cached": true,
+    "state": "warm",
+    "manifest_cached": true,
+    "cache_loaded_at": 1759000000000,
+    "total": 1204,
+    "sources": { "loaded": 2, "total": 2 }
+  },
   "ts": 1759000000123
 }
 ```
+
+`state` 用于区分「还没加载过」与「真的出问题了」，避免监控误报：
+
+| `state`    | 含义                                                    | 是否需要告警 |
+| :--------- | :------------------------------------------------------ | :----------- |
+| `warm`     | 所有来源都有可用缓存                                    | 否           |
+| `degraded` | 部分来源加载失败（见 `/api/admin/stats` 的 `failures`） | 视情况       |
+| `cold`     | 这个 isolate 还没加载过（冷启动时的正常状态）           | 否           |
+
+> 真正需要告警的组合是 `state === "cold"` **且** `manifest_cached === true`：
+> 说明来源已经枚举出来了，却一个都没加载成功。
 
 ### `POST /api/admin/refresh` — 强制刷新缓存（需鉴权）
 
@@ -177,7 +230,21 @@ quotify/
 不重新下载与解析正文；此时 `total` 仍与当前数据集一致。
 
 ```json
-{ "status": 200, "message": "ok.", "data": { "refreshed": true, "total": 1204, "loaded_at": 1759000000000, "sources": [{ "url": "https://.../a.json", "total": 600, "loaded_at": 1759000000000, "cached": false }], "failures": [], "manifest": { "url": "https://.../sources.json", "count": 2, "error": null } }, "ts": 1759000000123 }
+{
+  "status": 200,
+  "message": "ok.",
+  "data": {
+    "refreshed": true,
+    "total": 1204,
+    "loaded_at": 1759000000000,
+    "sources": [
+      { "url": "https://.../a.json", "total": 600, "loaded_at": 1759000000000, "cached": false }
+    ],
+    "failures": [],
+    "manifest": { "url": "https://.../sources.json", "count": 2, "error": null }
+  },
+  "ts": 1759000000123
+}
 ```
 
 ### `GET /api/admin/stats` — 数据统计（需鉴权）
@@ -187,6 +254,43 @@ quotify/
 `manifest` 是清单状态 `{ url, count, error }`，未配置清单时为 `null`。来源出问题时先看这里。
 
 鉴权方式：请求头 `Authorization: Bearer <ADMIN_TOKEN>`，Token 采用恒定时间比较。
+
+## Hitokoto 兼容层
+
+`GET /v1/hitokoto` 以 [Hitokoto](https://developer.hitokoto.cn/) 的契约返回**裸对象**（不套统一外壳），
+便于既有的一言客户端零改动迁移。映射关系：
+
+| Hitokoto 字段                          | 来源                                            |
+| :------------------------------------- | :---------------------------------------------- |
+| `id`                                   | 由 `quote.id` 指纹稳定派生的数字                |
+| `uuid`                                 | `quote.id`                                      |
+| `hitokoto`                             | `quote.content`                                 |
+| `type`                                 | `quote.category` 映射到的分类码（未收录 → `g`） |
+| `from`                                 | `quote.source`（缺省空串）                      |
+| `from_who`                             | `quote.author`（缺省空串）                      |
+| `creator` / `creator_uid` / `reviewer` | 固定为 `quotify` / `0` / `0`                    |
+| `commit_from`                          | 固定 `api`                                      |
+| `created_at`                           | 数据集的 `updated_at`                           |
+| `length`                               | `content` 的长度                                |
+
+分类码沿用 `a`–`l`：动画 `a`、漫画 `b`、游戏 `c`、文学 `d`、原创 `e`、网络 `f`、其他 `g`、
+影视 `h`、诗词 `i`、网易云 `j`、哲学 `k`、抖机灵 `l`。
+
+| 参数                        | 默认   | 说明                                                       |
+| :-------------------------- | :----- | :--------------------------------------------------------- |
+| `c`                         | 无     | 分类码（`a`–`l`），多个用逗号分隔（OR）                    |
+| `encode`                    | `json` | `json` / `text` / `js`（JSONP）                            |
+| `callback`                  | 无     | `encode=js` 时**必填**，必须是合法 JS 标识符（防脚本注入） |
+| `min_length` / `max_length` | 无     | 按 `content` 长度过滤                                      |
+
+```bash
+curl "$BASE/v1/hitokoto?c=d&encode=json"
+curl "$BASE/v1/hitokoto?encode=text"
+curl "$BASE/v1/hitokoto?encode=js&callback=hitokoto_cb"
+```
+
+> 兼容层只做字段与参数映射，不改原生接口；`/` 的行为也不变（仍是 302 到 `/api/quotes/`，
+> 与 `v1.hitokoto.cn` 直接返回 JSON 不同）。
 
 ## 数据仓库格式
 
@@ -235,35 +339,47 @@ quotify-data/
 - 每条记录必须含非空字符串 `id` 与 `content`。
 - `source` / `author` / `category` 可选，若存在必须是字符串；`tags` 可选，若存在必须是字符串数组。
 - 非法数据直接返回 `500` 并记录日志，**不会**静默丢弃，也**不会**写入 KV。
+- 多来源合并时按 `id` **去重**（保留靠前的来源），重复条目数记在 `/api/admin/stats` 的 `duplicates` 里。
 
-本仓库 `data/data.json` 是一份可直接推送的示例数据集（10 条）。
+本仓库 `data/data.json` 是一份可直接推送的示例数据集（10 条），并且**已被纳入 CI 校验**
+（`npm run validate:data`，见 `tests/data.test.ts`）；`data/schema.json` 是等价的 JSON Schema，
+供编辑器与外部工具复用。
 
 KV 键设计：
 
-| 键 | 值 | 说明 |
-|:---|:---|:---|
-| `quotify:data:v1:<URL 指纹>` | JSON 字符串 | 该来源的数据集（指纹 = 来源 URL 的 FNV-1a 哈希） |
-| `quotify:meta:v1:<URL 指纹>` | JSON 字符串 | `{ loaded_at, source_url, etag? }`；`source_url` 用于校验缓存归属，`etag` 用于条件请求 |
-| `quotify:manifest:v1:<URL 指纹>` | JSON 字符串 | 来源清单缓存：`{ raw, loadedAt, etag }`（未配置清单时不产生） |
+| 键                               | 值          | 说明                                                                                   |
+| :------------------------------- | :---------- | :------------------------------------------------------------------------------------- |
+| `quotify:data:v1:<URL 指纹>`     | JSON 字符串 | 该来源的数据集（指纹 = 来源 URL 的 FNV-1a 哈希）                                       |
+| `quotify:meta:v1:<URL 指纹>`     | JSON 字符串 | `{ loaded_at, source_url, etag? }`；`source_url` 用于校验缓存归属，`etag` 用于条件请求 |
+| `quotify:manifest:v1:<URL 指纹>` | JSON 字符串 | 来源清单缓存：`{ raw, loadedAt, etag }`（未配置清单时不产生）                          |
 
 键后缀由**来源 URL** 派生而不是数组下标，因此增删 / 重排来源都不会让某个来源读到别人的缓存；
 读取时还会比对 meta 里的 `source_url`，即使哈希碰撞也只会退化成一次「未命中 + 回源」。
 
 ## 环境变量
 
-| 名称 | 类型 | 默认 | 说明 |
-|:---|:---|:---|:---|
-| `DATA_SOURCES` | var | `[]`（不配置静态来源） | 数据集来源列表（**JSON 字符串数组**）。默认留空——来源全部由清单提供；需要静态兜底（清单不可用时仍有内容）时在此列出 |
-| `DATA_MANIFEST_URL` | var | 作者的 `quotify-data/sources.json` | **来源清单**地址（JSON 字符串数组），与 `DATA_SOURCES` 合并去重（上限 20）。改清单即可动态增减来源、**无需重新部署**；显式留空则关闭清单 |
-| `DATA_TTL` | var | `300` | KV 缓存 TTL（秒） |
-| `ROOT_REDIRECT` | var | `/api/quotes/` | 根路径 302 重定向目标（仅接受站内绝对路径） |
-| `ENVIRONMENT` | var | `production` | 环境标识 |
-| `ADMIN_TOKEN` | **secret** | 本地开发默认 `dev-secret-token` | 管理接口 Token |
-| `CACHE` | KV binding | — | 缓存命名空间 |
-| `PUBLIC_RATE_LIMITER` | ratelimit binding | 60 / 60s | 公开接口限流 |
-| `ADMIN_RATE_LIMITER` | ratelimit binding | 10 / 60s | 管理接口限流 |
+| 名称                  | 类型              | 默认                               | 说明                                                                                                                                     |
+| :-------------------- | :---------------- | :--------------------------------- | :--------------------------------------------------------------------------------------------------------------------------------------- |
+| `DATA_SOURCES`        | var               | `[]`（不配置静态来源）             | 数据集来源列表（**JSON 字符串数组**）。默认留空——来源全部由清单提供；需要静态兜底（清单不可用时仍有内容）时在此列出                      |
+| `DATA_MANIFEST_URL`   | var               | 作者的 `quotify-data/sources.json` | **来源清单**地址（JSON 字符串数组），与 `DATA_SOURCES` 合并去重（上限 20）。改清单即可动态增减来源、**无需重新部署**；显式留空则关闭清单 |
+| `DATA_TTL`            | var               | `300`                              | KV 缓存 TTL（秒）。会被夹紧到 `[60, 31536000]`：低于 60 会让 KV 写入直接抛错                                                             |
+| `DATA_SOURCE_HOSTS`   | var               | `""`（不限制）                     | 来源主机白名单（逗号分隔）。配置后，**来源清单**里解析出的地址必须命中白名单才允许加载（防 SSRF / 清单被篡改）                           |
+| `ROOT_REDIRECT`       | var               | `/api/quotes/`                     | 根路径 302 重定向目标（仅接受站内绝对路径）                                                                                              |
+| `ENVIRONMENT`         | var               | `production`                       | 环境标识                                                                                                                                 |
+| `ADMIN_TOKEN`         | **secret**        | **无默认值**                       | 管理接口 Token。未配置时管理接口直接 `500` 并打告警                                                                                      |
+| `CACHE`               | KV binding        | —                                  | 缓存命名空间                                                                                                                             |
+| `PUBLIC_RATE_LIMITER` | ratelimit binding | 60 / 60s                           | 公开接口限流                                                                                                                             |
+| `ADMIN_RATE_LIMITER`  | ratelimit binding | 10 / 60s                           | 管理接口限流                                                                                                                             |
+| `HEALTH_RATE_LIMITER` | ratelimit binding | 300 / 60s                          | `/` 与 `/api/health` 的宽松限流                                                                                                          |
 
-生产环境必须执行 `npx wrangler secret put ADMIN_TOKEN`，secret 会覆盖 `wrangler.toml` 中的同名 var。
+生产环境必须执行 `npx wrangler secret put ADMIN_TOKEN`；本地开发请把
+`ADMIN_TOKEN=...` 写进 `.dev.vars`（参考 `.dev.vars.example`，该文件已在 `.gitignore` 中）。
+
+> `ADMIN_TOKEN` **刻意不再提供默认值**：遗漏 `wrangler secret put` 时，宁可让管理接口 500，
+> 也不能带着一个公开已知的口令上线。
+
+> 限流只以 `CF-Connecting-IP` 分桶。刻意**不**回退到 `x-forwarded-for`：
+> 那是客户端完全可控的请求头，轮换它就能绕过限流。
 
 > 关于 `compatibility_date`：规范要求 `2026-09-01`，但本地测试链路
 > （`@cloudflare/vitest-pool-workers` 内置的 miniflare / workerd）当前最高支持 `2026-08-22`，
@@ -273,6 +389,9 @@ KV 键设计：
 
 ```bash
 npm install
+
+# 准备本地密钥（管理接口用；未配置时管理接口会 500）
+cp .dev.vars.example .dev.vars
 
 # 启动本地开发服务器（默认 http://127.0.0.1:8787）
 npm run dev
@@ -285,13 +404,17 @@ npx wrangler dev --var 'DATA_SOURCES:["http://127.0.0.1:8788/data.json"]'
 其它脚本：
 
 ```bash
-npm test           # vitest run，在 Workers 运行时中执行集成测试
-npm run typecheck  # tsc --noEmit
-npm run cf-typegen # 修改 wrangler.toml 后重新生成 worker-configuration.d.ts
+npm test             # vitest run，在 Workers 运行时中执行全部测试
+npm run typecheck    # tsc --noEmit
+npm run lint         # ESLint 静态检查（npm run lint:fix 自动修复）
+npm run format       # Prettier 格式化（npm run format:check 只检查）
+npm run validate:data # 校验 data/data.json
+npm run cf-typegen   # 修改 wrangler.toml 后重新生成 worker-configuration.d.ts
 ```
 
 > `worker-configuration.d.ts` 由 `wrangler types` 生成（包含 `KVNamespace`、`RateLimit` 等运行时类型
-> 以及全局 `Env`），修改 `wrangler.toml` 后需要重新生成。
+> 以及全局 `Env`），已在 `.gitignore` 中，修改 `wrangler.toml` 后需要重新生成。
+> 业务代码只依赖 `src/types/env.ts` 这份契约，不直接使用生成的字面量类型。
 
 ## 自建部署教程（Fork 并托管自己的引语 API）
 
@@ -323,8 +446,10 @@ npm run cf-typegen # 修改 wrangler.toml 后重新生成 worker-configuration.d
 在数据仓库根目录放一份 `sources.json`，列出各个数据文件的地址，再把 `DATA_MANIFEST_URL` 指向它：
 
 ```json
-["https://raw.githubusercontent.com/<你的用户名>/my-quotes-data/main/data/poetry.json",
- "https://raw.githubusercontent.com/<你的用户名>/my-quotes-data/main/data/sayings.json"]
+[
+  "https://raw.githubusercontent.com/<你的用户名>/my-quotes-data/main/data/poetry.json",
+  "https://raw.githubusercontent.com/<你的用户名>/my-quotes-data/main/data/sayings.json"
+]
 ```
 
 ```toml
@@ -347,8 +472,10 @@ DATA_MANIFEST_URL = ""
 > 对应注释：「Fork 后请换成你自己的仓库地址，**否则你改不动数据**」。保持默认值时，
 > 你的实例会一直读取作者的数据集，自己改数据不会有任何效果。
 >
-> ⚠️ `DATA_SOURCES` 必须是**合法的 JSON 字符串数组**；写错（不是数组 / 不是合法 JSON）时接口直接报 `500`
-> 并给出提示，不会静默回退——避免「配置写错了却毫无察觉」。`DATA_MANIFEST_URL` 显式留空则关闭清单。
+> ⚠️ `DATA_SOURCES` 必须是**合法的 JSON 字符串数组**。写错时**不会**让接口直接 `500`：
+> 静态来源被降级为空列表（错误打到日志），来源改由清单提供；
+> 只有当清单也解析不出任何来源时，才会报 `500` 并提示「未解析到任何数据来源」。
+> 这样一处配置笔误不会让整个 API 不可用。`DATA_MANIFEST_URL` 显式留空则关闭清单。
 
 ### 3. 创建你自己的 KV 命名空间
 
@@ -369,33 +496,47 @@ id = "<上一步输出的 id>"
 
 ### 4. 设置管理接口 Token
 
-`wrangler.toml` 里的 `ADMIN_TOKEN = "dev-secret-token"` 只是本地开发默认值，生产环境必须用 secret 覆盖：
+`wrangler.toml` 里**没有** `ADMIN_TOKEN` 默认值（避免把公开已知的口令带上线），需要自己注入：
 
 ```bash
+# 本地开发：写进 .dev.vars（已在 .gitignore 中）
+cp .dev.vars.example .dev.vars   # 然后修改里面的 ADMIN_TOKEN
+
+# 生产环境：用 secret
 npx wrangler secret put ADMIN_TOKEN
 ```
 
-> 对应注释：「本地开发默认值；生产环境请用 `wrangler secret put ADMIN_TOKEN` 覆盖」。
-> secret 优先级高于同名 var，且不会进入仓库。
+> 未配置时管理接口（`/api/admin/*`）会直接返回 `500` 并在日志里告警——
+> 这是刻意设计：`401` 会暴露「接口存在、只是口令不对」，`500` + 告警才是安全的失败方式。
 
 ### 5. 按需调整其它变量
 
-| 变量 | 是否必须改 | 说明 |
-|:---|:---|:---|
-| `ROOT_REDIRECT` | 否 | 访问根域时的 302 目标，默认 `/api/quotes/`；只接受站内绝对路径 |
-| `DATA_TTL` | 否 | KV 缓存 TTL（秒），默认 `300` |
-| `ENVIRONMENT` | 否 | 环境标识，会出现在 `/api/health` 响应中 |
-| `[[ratelimits]].namespace_id` | 建议 | 见下方说明 |
+| 变量                           | 是否必须改 | 说明                                                           |
+| :----------------------------- | :--------- | :------------------------------------------------------------- |
+| `ROOT_REDIRECT`                | 否         | 访问根域时的 302 目标，默认 `/api/quotes/`；只接受站内绝对路径 |
+| `DATA_TTL`                     | 否         | KV 缓存 TTL（秒），默认 `300`；越界会被夹紧到 `[60, 31536000]` |
+| `DATA_SOURCE_HOSTS`            | 建议       | 留空表示不限制主机；建议至少锁到你的数据托管域名               |
+| `ENVIRONMENT`                  | 否         | 环境标识，会出现在 `/api/health` 响应中                        |
+| `[[ratelimits]].namespace_id`  | 建议       | 见下方说明                                                     |
+| `[[kv_namespaces]].preview_id` | 建议       | 见下方说明（否则 `wrangler dev --remote` 会读写生产 KV）       |
 
 > 对应注释：「访问根域（`/`）时 302 跳转的目标（站内绝对路径），默认指向公开随机一言接口」。
 >
-> ⚠️ **限流绑定的 `namespace_id`** 是「账号内唯一」的标识：同一账号下若已有 Worker 用了 `1001` / `1002`，
-> 两者会共享同一份限流计数。若遇到意料之外的 429，把它们改成不冲突的数字。
+> ⚠️ **限流绑定的 `namespace_id`** 是「账号内唯一」的标识：同一账号下若已有 Worker 用了相同的值，
+> 两者会共享同一份限流计数。默认值已取较不常用的 `9101` / `9102` / `9103`，
+> 若遇到意料之外的 429，把它们改成不冲突的数字。
+>
+> ⚠️ **`preview_id`** 缺省时 `wrangler dev --remote` 会直接读写生产 KV。
+> 请执行 `npx wrangler kv namespace create quotify-cache-preview` 并把输出 id 填进去。
 
 ### 6. 部署
 
 ```bash
+# 生产环境
 npx wrangler deploy
+
+# 预发布环境（用独立 KV，不会污染生产缓存）
+npx wrangler deploy --env staging
 ```
 
 部署完成后终端会输出形如 `https://quotify-api.<你的子域>.workers.dev` 的访问地址。
@@ -432,7 +573,12 @@ curl -X POST -H "Authorization: Bearer <你的 ADMIN_TOKEN>" "$BASE/api/admin/re
 - **`/api/quotes` 一直返回 500？** 说明**所有来源**都加载失败了（单个来源失败只会被跳过）。常见原因是数据集格式不合规：
   根字段不是 `quotes`，或某条记录缺 `id` / `content`。校验不通过时不会写入缓存，日志里会指出是哪个来源、第几条、哪个字段。
 - **某个来源挂了会有影响吗？** 不会：该来源被跳过，其余来源照常提供服务；`/api/admin/stats` 的 `failures` 里能看到具体原因和 URL。
-- **管理接口返回 401？** 检查请求头为 `Authorization: Bearer <token>`，且 token 与 `ADMIN_TOKEN` 一致（secret 优先于 var）。
+- **管理接口返回 401？** 检查请求头为 `Authorization: Bearer <token>`，且 token 与 `ADMIN_TOKEN` 一致。
+- **管理接口返回 500 并提示未配置 ADMIN_TOKEN？** 说明 `ADMIN_TOKEN` 没注入成功：
+  本地请把 `ADMIN_TOKEN=...` 写进 `.dev.vars`，生产请执行 `npx wrangler secret put ADMIN_TOKEN`。
+- **`/api/health` 一直是 `cold`？** 冷启动（或 isolate 刚被回收）时的正常状态，
+  只要 `manifest_cached` 为 `false` 就只是「还没加载过」；若它已经是 `true` 却仍为 `cold`，
+  再去 `/api/admin/stats` 看 `failures`。
 - **改了 `wrangler.toml` 后类型报错？** 执行 `npm run cf-typegen` 重新生成 `worker-configuration.d.ts`。
 
 ## curl 调用示例清单
@@ -474,6 +620,11 @@ curl --get "$BASE/api/quotes/search" --data-urlencode "q=人" --data-urlencode "
 curl "$BASE/api/quotes/categories"
 curl "$BASE/api/quotes/tags"
 
+# Hitokoto 兼容层（裸对象 / 纯文本 / JSONP）
+curl "$BASE/v1/hitokoto?c=d"
+curl "$BASE/v1/hitokoto?encode=text"
+curl "$BASE/v1/hitokoto?encode=js&callback=hitokoto_cb"
+
 # 参数错误示例（400）
 curl "$BASE/api/quotes/search"
 
@@ -489,18 +640,23 @@ curl -H "Authorization: Bearer $ADMIN_TOKEN" "$BASE/api/admin/stats"
 
 ## 生产验证清单
 
-1. `npm test` —— 54 个用例全部通过。
+1. `npm test` —— 全部用例通过（当前 138 个）。
 2. `npm run typecheck` —— 无类型错误。
-3. `curl -i "$BASE/"` —— 返回 `302` 且 `Location` 指向 `/api/quotes/`。
-4. `curl "$BASE/api/health"` —— `status=200`、`data.service="quotify"`，且 `data.sources` 显示「已缓存 / 配置总数」。
-5. 首次 `curl "$BASE/api/quotes"` —— 返回数据且 KV 被写入；再次请求 `data.cached` 为 `true`。
-6. `curl -i -X OPTIONS "$BASE/api/quotes"` —— 返回 `Access-Control-Allow-Origin: *`。
-7. `curl -i "$BASE/api/health"` —— 含 `X-Content-Type-Options: nosniff` 与 `Referrer-Policy: no-referrer`。
-8. `curl -i "$BASE/api/quotes/categories"` —— 含 `Cache-Control: public, max-age=3600` 与 `ETag`；
-   带上该 `ETag` 的 `If-None-Match` 再次请求 —— 返回 `304`。
-9. `curl -X POST "$BASE/api/admin/refresh"`（无 Token）—— 返回 `401`。
-10. `curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" "$BASE/api/admin/refresh"` —— 返回 `200` 且 `total` 与数据仓库条数一致。
-11. 把 `data.json` 中某条记录的 `content` 置空并提交 —— 管理刷新接口应返回 `500`，且 KV 中仍是上一份合法数据。
-12. 配好两个 `DATA_SOURCES` 后 `curl "$BASE/api/admin/stats"` —— `sources` 有两项，`total` 等于两个数据集条数之和。
-13. （可选）配置 `DATA_MANIFEST_URL` 后 `curl "$BASE/api/admin/stats"` —— `manifest` 显示清单地址、解析出的来源数，
+3. `npm run lint && npm run format:check` —— 无静态检查 / 风格问题。
+4. `curl -i "$BASE/"` —— 返回 `302` 且 `Location` 指向 `/api/quotes/`。
+5. `curl "$BASE/api/health"` —— `status=200`、`data.service="quotify"`，
+   `data.state` 为 `warm` / `cold`，`data.sources` 显示「已缓存 / 配置总数」。
+6. 首次 `curl "$BASE/api/quotes"` —— 返回数据且 KV 被写入；再次请求 `data.cached` 为 `true`。
+7. `curl -i "$BASE/api/quotes"` —— 含 `Cache-Control: no-store`（随机结果不能被缓存）。
+8. `curl -i -X OPTIONS "$BASE/api/quotes"` —— 返回 `Access-Control-Allow-Origin: *`。
+9. `curl -i "$BASE/api/health"` —— 含 `X-Content-Type-Options: nosniff` 与 `Referrer-Policy: no-referrer`。
+10. `curl -i "$BASE/api/quotes/categories"` —— 含 `Cache-Control: public, max-age=300`（默认 TTL）与 `ETag`；
+    带上该 `ETag` 的 `If-None-Match` 再次请求 —— 返回 `304`。
+11. `curl -X POST "$BASE/api/admin/refresh"`（无 Token）—— 返回 `401`。
+12. `curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" "$BASE/api/admin/refresh"` —— 返回 `200` 且 `total` 与数据仓库条数一致。
+13. 把 `data.json` 中某条记录的 `content` 置空并提交 —— 管理刷新接口应返回 `500`，且 KV 中仍是上一份合法数据。
+14. 配好两个 `DATA_SOURCES` 后 `curl "$BASE/api/admin/stats"` —— `sources` 有两项，`total` 等于两个数据集条数之和
+    （若有重复 `id` 会被去重，看 `duplicates`）。
+15. （可选）配置 `DATA_MANIFEST_URL` 后 `curl "$BASE/api/admin/stats"` —— `manifest` 显示清单地址、解析出的来源数，
     且清单里新增的来源已被合并进 `total`。
+16. （可选）`curl "$BASE/v1/hitokoto?c=d"` —— 返回含 `hitokoto` / `type` / `from` 的裸对象。

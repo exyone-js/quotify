@@ -18,11 +18,18 @@ DATA_SOURCES = '[]'
 # 增减来源只需改这个清单文件，不必重新部署 Worker。显式留空则关闭清单。
 # Fork 后请换成你自己的仓库地址，否则你改不动数据。
 DATA_MANIFEST_URL = "https://raw.githubusercontent.com/exyone-js/quotify-data/main/sources.json"
+# 来源主机白名单（逗号分隔，可选）。留空表示不限制主机；
+# 配置后，来源清单里解析出的地址必须命中白名单才允许加载（防 SSRF / 清单被篡改）。
+# 公开仓库场景下建议至少锁到 raw.githubusercontent.com。
+DATA_SOURCE_HOSTS = ""
 DATA_TTL = "300"
-# 访问根域（`/`）时 302 跳转的目标（站内绝对路径），默认指向公开随机一言接口
+# 访问根域（`/`）时 302 跳转的目标（站内绝对路径），默认指向公开随机一言接口。
+# 只接受站内绝对路径；写成外链或 `//host`、`/\host` 都会被回退到默认值。
 ROOT_REDIRECT = "/api/quotes/"
-# 本地开发默认值；生产环境请用 `wrangler secret put ADMIN_TOKEN` 覆盖
-ADMIN_TOKEN = "dev-secret-token"
+# 管理接口 Token：**不要在这里写默认值**。
+# 本地开发请把 `ADMIN_TOKEN=...` 写进 `.dev.vars`（已在 .gitignore 中）；
+# 生产环境请执行 `npx wrangler secret put ADMIN_TOKEN`。
+# 未配置时管理接口会直接返回 500 并打告警，而不是带着公开已知的口令上线。
 
 [[kv_namespaces]]
 binding = "CACHE"
@@ -30,16 +37,44 @@ binding = "CACHE"
 # 创建命令：npx wrangler kv namespace create quotify-cache
 # 然后用输出结果里的 id 覆盖下一行（完整部署步骤见 README「部署」章节）。
 id = "b38989b10a4d4a119bd6bb8adc93e21b"
+# preview_id 用于 `wrangler dev --remote`：缺省时会读写生产 KV，非常危险。
+# 创建命令：npx wrangler kv namespace create quotify-cache-preview
+preview_id = "REPLACE_WITH_PREVIEW_NAMESPACE_ID"
 
+# 速率限制。namespace_id 是同一账号内的共享命名空间，
+# 这里刻意取不常用的值，避免与其它 Worker 的默认 1001 / 1002 撞在一起。
 [[ratelimits]]
 name = "PUBLIC_RATE_LIMITER"
-namespace_id = "1001"
+namespace_id = "9101"
 simple = { limit = 60, period = 60 }
 
 [[ratelimits]]
 name = "ADMIN_RATE_LIMITER"
-namespace_id = "1002"
+namespace_id = "9102"
 simple = { limit = 10, period = 60 }
+
+# 宽松限流：用于 `/`（重定向）与 `/api/health` 这两个低成本入口。
+[[ratelimits]]
+name = "HEALTH_RATE_LIMITER"
+namespace_id = "9103"
+simple = { limit = 300, period = 60 }
 
 [observability]
 enabled = true
+# 默认 100% 采样，高流量下追踪成本很高；0.1 足以保留统计代表性。
+head_sampling_rate = 0.1
+
+# 预发布环境：与主环境共享代码，但用自己的 KV，避免本地 / 预发写脏生产缓存。
+# 部署：`npx wrangler deploy --env staging`
+[env.staging.vars]
+ENVIRONMENT = "staging"
+DATA_SOURCES = '[]'
+DATA_MANIFEST_URL = "https://raw.githubusercontent.com/exyone-js/quotify-data/main/sources.json"
+DATA_SOURCE_HOSTS = ""
+DATA_TTL = "300"
+ROOT_REDIRECT = "/api/quotes/"
+
+[[env.staging.kv_namespaces]]
+binding = "CACHE"
+# 同样需要替换成你自己的命名空间 id。
+id = "REPLACE_WITH_STAGING_NAMESPACE_ID"

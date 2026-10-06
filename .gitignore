@@ -1,6 +1,10 @@
 node_modules/
 dist/
 .wrangler/
+.wrangler-tmp/
 .dev.vars
 *.log
 tmp/
+# 由 `npm run cf-typegen` 生成：只保留一份「事实来源」（wrangler.toml），
+# 生成物不入库，避免与配置漂移（CI 与本地都在使用前重新生成）。
+worker-configuration.d.ts

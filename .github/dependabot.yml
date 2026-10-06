@@ -1,0 +1,27 @@
+version: 2
+updates:
+  # 运行时依赖每周检查一次（本项目只有 hono，但升级仍需人工确认）。
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+    groups:
+      # 把工具链的小版本合并成一个 PR，避免刷屏。
+      dev-tooling:
+        patterns:
+          - eslint
+          - '@eslint/*'
+          - prettier
+          - typescript
+          - typescript-eslint
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    labels:
+      - dependencies
+      - ci

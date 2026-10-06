@@ -11,7 +11,7 @@ const BEARER_PREFIX = 'Bearer ';
  * 避免通过响应时间差逐位推断 Token。长度差异本身无法完全隐藏，
  * 但 Token 长度不属于敏感信息。
  */
-function safeEqual(a: string, b: string): boolean {
+export function safeEqual(a: string, b: string): boolean {
   const max = Math.max(a.length, b.length);
   let diff = a.length ^ b.length;
   for (let i = 0; i < max; i += 1) {
@@ -26,6 +26,11 @@ export function adminAuth(): MiddlewareHandler<{ Bindings: Env }> {
   return async (c, next) => {
     const expected = c.env.ADMIN_TOKEN?.trim();
     if (!expected) {
+      // 未配置 Token 时**拒绝服务**而不是放行：宁可让管理接口 500，
+      // 也不能带着一个公开已知的默认值上线。
+      console.error(
+        '[quotify] 未配置 ADMIN_TOKEN，管理接口已禁用。请执行：wrangler secret put ADMIN_TOKEN',
+      );
       throw ApiError.internal('服务端未配置 ADMIN_TOKEN，管理接口不可用。');
     }
 

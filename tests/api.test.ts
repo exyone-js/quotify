@@ -9,15 +9,12 @@ import {
   resolveManifestUrl,
   resolveRootRedirect,
 } from '../src/config';
-import {
-  invalidateMemoryCache,
-  loadDatasetWithMeta,
-  refreshAllSources,
-} from '../src/data/loader';
+import { invalidateMemoryCache, loadDatasetWithMeta, refreshAllSources } from '../src/data/loader';
 import { publicRateLimit } from '../src/middleware/rateLimit';
 import type { Env } from '../src/types/env';
 import { toErrorResponse } from '../src/utils/error';
 import { fail } from '../src/utils/response';
+import { TEST_ADMIN_TOKEN } from './test-token';
 
 interface Envelope<T> {
   status: number;
@@ -142,7 +139,8 @@ const DATASET_B = {
 /** 默认来源清单（由 wrangler.toml 的 DATA_MANIFEST_URL 提供，测试环境必定存在）。 */
 const DEFAULT_MANIFEST = resolveManifestUrl(env as unknown as Env) as string;
 /** 默认清单里列出的数据集地址（测试桩按此地址返回 DATASET）。 */
-const SOURCE_URL = 'https://raw.githubusercontent.com/exyone-js/quotify-data/main/data/literature.json';
+const SOURCE_URL =
+  'https://raw.githubusercontent.com/exyone-js/quotify-data/main/data/literature.json';
 /** 多来源 / 自定义清单用例使用的地址。 */
 const SOURCE_A = 'https://example.test/a.json';
 const SOURCE_B = 'https://example.test/b.json';
@@ -163,13 +161,17 @@ const CACHE_KEYS = [
   manifestKey(CUSTOM_MANIFEST_URL),
 ];
 const BASE = 'https://quotify.test';
-const ADMIN_TOKEN = 'dev-secret-token';
+/** 与 vitest.config.ts 注入给 miniflare 的值一致（见 tests/test-token.ts）。 */
+const ADMIN_TOKEN = TEST_ADMIN_TOKEN;
 
 /** 上游被调用的次数，用于验证懒加载与缓存命中。 */
 let upstreamCalls = 0;
 
 /** 发请求并解析统一响应外壳。 */
-async function call<T>(path: string, init?: RequestInit): Promise<{ res: Response; body: Envelope<T> }> {
+async function call<T>(
+  path: string,
+  init?: RequestInit,
+): Promise<{ res: Response; body: Envelope<T> }> {
   const res = await SELF.fetch(`${BASE}${path}`, init);
   const body = (await res.json()) as Envelope<T>;
   return { res, body };
@@ -222,6 +224,8 @@ describe('GET /api/health', () => {
     const { res, body } = await call<{
       service: string;
       cached: boolean;
+      state: string;
+      manifest_cached: boolean;
       total: number;
       sources: { loaded: number; total: number };
     }>('/api/health');
@@ -232,18 +236,23 @@ describe('GET /api/health', () => {
     expect(body.data.service).toBe('quotify');
     expect(typeof body.data.total).toBe('number');
     // 冷启动：清单尚未缓存，无法枚举来源 → 0/0（健康检查不回源，这是预期行为）
+    // state 用于区分「还没加载过」（cold）与「有来源却加载不出来」（真正故障）。
     expect(body.data.cached).toBe(false);
+    expect(body.data.state).toBe('cold');
+    expect(body.data.manifest_cached).toBe(false);
     expect(body.data.sources).toEqual({ loaded: 0, total: 0 });
 
     // 预热之后：来源与内容都已在缓存中
     await call<Quote[]>('/api/quotes');
     const warm = await call<{
       cached: boolean;
+      state: string;
       total: number;
       sources: { loaded: number; total: number };
     }>('/api/health');
 
     expect(warm.body.data.cached).toBe(true);
+    expect(warm.body.data.state).toBe('warm');
     expect(warm.body.data.sources).toEqual({ loaded: 1, total: 1 });
     expect(warm.body.data.total).toBe(DATASET.quotes.length);
   });
@@ -258,6 +267,9 @@ describe('GET /api/quotes', () => {
     expect(body.data).toHaveLength(1);
 
     const item = body.data[0];
+    expect(item).toBeDefined();
+    if (item === undefined) return;
+
     expect(typeof item.id).toBe('string');
     expect(item.id.length).toBeGreaterThan(0);
     expect(typeof item.content).toBe('string');
@@ -276,7 +288,7 @@ describe('GET /api/quotes', () => {
 
   it('4. category=文学 结果分类全部匹配', async () => {
     const { res, body } = await call<Quote[]>(
-      `/api/quotes?category=${encodeURIComponent('文学')}&limit=5`
+      `/api/quotes?category=${encodeURIComponent('文学')}&limit=5`,
     );
 
     expect(res.status).toBe(200);
@@ -288,7 +300,7 @@ describe('GET /api/quotes', () => {
 
   it('5. tag=古诗,人生 至少命中一个标签', async () => {
     const { res, body } = await call<Quote[]>(
-      `/api/quotes?tag=${encodeURIComponent('古诗,人生')}&limit=5`
+      `/api/quotes?tag=${encodeURIComponent('古诗,人生')}&limit=5`,
     );
 
     expect(res.status).toBe(200);
@@ -318,9 +330,7 @@ describe('GET /api/quotes', () => {
 
 describe('GET /api/quotes/search', () => {
   it('6. q=人生 结果包含关键词', async () => {
-    const { res, body } = await call<Quote[]>(
-      `/api/quotes/search?q=${encodeURIComponent('人生')}`
-    );
+    const { res, body } = await call<Quote[]>(`/api/quotes/search?q=${encodeURIComponent('人生')}`);
 
     expect(res.status).toBe(200);
     expect(body.data.length).toBeGreaterThan(0);
@@ -371,10 +381,10 @@ describe('POST /api/admin/refresh', () => {
   });
 
   it('10. 携带正确 Token 返回 200 且刷新成功', async () => {
-    const { res, body } = await call<{ refreshed: boolean; total: number }>(
-      '/api/admin/refresh',
-      { method: 'POST', headers: { Authorization: `Bearer ${ADMIN_TOKEN}` } }
-    );
+    const { res, body } = await call<{ refreshed: boolean; total: number }>('/api/admin/refresh', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${ADMIN_TOKEN}` },
+    });
 
     expect(res.status).toBe(200);
     expect(body.data.refreshed).toBe(true);
@@ -479,9 +489,7 @@ describe('路径尾斜杠兼容', () => {
     expect(root.res.status).toBe(200);
     expect(root.body.data).toHaveLength(1);
 
-    const search = await call<Quote[]>(
-      `/api/quotes/search/?q=${encodeURIComponent('人生')}`
-    );
+    const search = await call<Quote[]>(`/api/quotes/search/?q=${encodeURIComponent('人生')}`);
     expect(search.res.status).toBe(200);
     expect(search.body.data.length).toBeGreaterThan(0);
   });
@@ -548,9 +556,7 @@ describe('resolveRootRedirect', () => {
   });
 
   it('拒绝站外地址与协议相对地址，回退默认值', () => {
-    expect(resolveRootRedirect({ ROOT_REDIRECT: 'https://evil.com' } as Env)).toBe(
-      '/api/quotes/'
-    );
+    expect(resolveRootRedirect({ ROOT_REDIRECT: 'https://evil.com' } as Env)).toBe('/api/quotes/');
     expect(resolveRootRedirect({ ROOT_REDIRECT: '//evil.com' } as Env)).toBe('/api/quotes/');
     expect(resolveRootRedirect({ ROOT_REDIRECT: 'api/quotes' } as Env)).toBe('/api/quotes/');
   });
@@ -564,7 +570,9 @@ describe('派生接口的 HTTP 缓存', () => {
   it('返回 Cache-Control 与 ETag，命中 If-None-Match 时返回 304', async () => {
     const first = await SELF.fetch(`${BASE}/api/quotes/categories`);
     expect(first.status).toBe(200);
-    expect(first.headers.get('Cache-Control')).toContain('max-age=3600');
+    // 与 DATA_TTL 取小（默认 300），避免客户端缓存得比数据集刷新周期还久。
+    expect(first.headers.get('Cache-Control')).toContain('max-age=300');
+    expect(first.headers.get('Vary')).toContain('Accept-Encoding');
 
     const etag = first.headers.get('ETag') ?? '';
     expect(etag).not.toBe('');
@@ -738,9 +746,9 @@ describe('多来源数据集', () => {
     const result = await loadDatasetWithMeta(sourceEnv([SOURCE_A, SOURCE_B]));
 
     expect(result.sources).toHaveLength(1);
-    expect(result.sources[0].url).toBe(SOURCE_A);
+    expect(result.sources[0]?.url).toBe(SOURCE_A);
     expect(result.failures).toHaveLength(1);
-    expect(result.failures[0].url).toBe(SOURCE_B);
+    expect(result.failures[0]?.url).toBe(SOURCE_B);
     expect(result.dataset.quotes).toHaveLength(DATASET.quotes.length);
   });
 
@@ -748,7 +756,7 @@ describe('多来源数据集', () => {
     vi.stubGlobal('fetch', async () => new Response('boom', { status: 503 }));
 
     await expect(loadDatasetWithMeta(sourceEnv([SOURCE_A, SOURCE_B]))).rejects.toThrow(
-      /均加载失败/
+      /均加载失败/,
     );
   });
 
@@ -772,10 +780,15 @@ describe('多来源数据集', () => {
     expect(second.dataset.quotes).toHaveLength(DATASET.quotes.length + 1);
   });
 
-  it('DATA_SOURCES 非法时直接报错，而不是静默回退到默认来源', async () => {
+  it('DATA_SOURCES 非法时降级为「不设静态来源」，清单来源照常可用', async () => {
     const broken = { CACHE: env.CACHE, DATA_SOURCES: 'not-json' } as unknown as Env;
 
-    await expect(loadDatasetWithMeta(broken)).rejects.toThrow(/DATA_SOURCES/);
+    // 一个配置笔误不该让整个 API 不可用：静态来源被丢弃，来源改由清单提供。
+    const result = await loadDatasetWithMeta(broken);
+
+    expect(result.sources).toHaveLength(1);
+    expect(result.sources[0]?.url).toBe(SOURCE_URL);
+    expect(result.dataset.quotes).toHaveLength(DATASET.quotes.length);
   });
 
   it('来源重排后仍各自命中自己的缓存，不会串数据', async () => {
@@ -795,10 +808,10 @@ describe('多来源数据集', () => {
     expect(calls).toBe(2); // 两边都命中各自缓存，无需回源
     expect(reversed.cached).toBe(true);
     expect(reversed.sources.find((item) => item.url === SOURCE_B)?.total).toBe(
-      DATASET_B.quotes.length
+      DATASET_B.quotes.length,
     );
     expect(reversed.sources.find((item) => item.url === SOURCE_A)?.total).toBe(
-      DATASET.quotes.length
+      DATASET.quotes.length,
     );
   });
 
@@ -918,7 +931,7 @@ describe('来源配置解析', () => {
 
   it('自定义 DATA_MANIFEST_URL 时优先使用它（并去掉首尾空白）', () => {
     expect(resolveManifestUrl({ DATA_MANIFEST_URL: ' https://x/y.json ' } as Env)).toBe(
-      'https://x/y.json'
+      'https://x/y.json',
     );
   });
 });

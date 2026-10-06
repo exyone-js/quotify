@@ -1,0 +1,7 @@
+# 由 `wrangler types` 生成，不参与格式化。
+worker-configuration.d.ts
+package-lock.json
+node_modules/
+.wrangler/
+.wrangler-tmp/
+dist/

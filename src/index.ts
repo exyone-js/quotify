@@ -2,8 +2,10 @@ import { Hono } from 'hono';
 import { resolveRootRedirect } from './config';
 import { peekCache } from './data/loader';
 import { cors } from './middleware/cors';
+import { looseRateLimit } from './middleware/rateLimit';
 import { securityHeaders } from './middleware/security';
 import adminRoutes from './routes/admin';
+import compatRoutes from './routes/compat';
 import quotesRoutes from './routes/quotes';
 import type { Env } from './types/env';
 import { toErrorResponse } from './utils/error';
@@ -21,12 +23,18 @@ app.use('*', securityHeaders());
 app.use('*', cors());
 
 // 3. 健康检查：只读缓存状态，不触发回源。
-app.get('/api/health', async (c) => {
-  const { cached, loadedAt, total, sourcesLoaded, sourcesTotal } = await peekCache(c.env);
+//    即便成本很低也挂宽松限流，挡掉低成本的探测 / 放大流量。
+app.get('/api/health', looseRateLimit(), async (c) => {
+  const { cached, state, loadedAt, total, sourcesLoaded, sourcesTotal, manifestCached } =
+    await peekCache(c.env);
   return ok({
     service: 'quotify',
     environment: c.env.ENVIRONMENT ?? 'unknown',
     cached,
+    // cold 只是「这个 isolate 还没加载过」，不等于故障；
+    // 真正要告警的是 state === 'cold' 且 manifestCached 为 true（有来源却一个都没加载出来）。
+    state,
+    manifest_cached: manifestCached,
     cache_loaded_at: loadedAt,
     total,
     // 数据源就绪情况：已缓存 / 配置总数。
@@ -38,7 +46,7 @@ app.get('/api/health', async (c) => {
 //    仅改写 pathname、保留原始查询串，因此 `/?limit=5` 等价于 `/api/quotes/?limit=5`。
 //    目标可通过 ROOT_REDIRECT 配置，且只允许站内绝对路径（见 resolveRootRedirect）。
 //    Hono 会把 HEAD 请求按 GET 处理并剥离响应体，故无需额外注册 HEAD。
-app.get('/', (c) => {
+app.get('/', looseRateLimit(), (c) => {
   const url = new URL(c.req.url);
   url.pathname = resolveRootRedirect(c.env);
   // 302：临时重定向，避免浏览器把「随机一言」的入口永久缓存成一个固定结果。
@@ -48,6 +56,8 @@ app.get('/', (c) => {
 // 5. 业务路由。
 app.route('/api/quotes', quotesRoutes);
 app.route('/api/admin', adminRoutes);
+// Hitokoto 兼容层：让现有一言客户端可以直接迁移过来。
+app.route('/v1/hitokoto', compatRoutes);
 
 // 6. 未匹配路由统一 404。
 app.notFound((c) => {

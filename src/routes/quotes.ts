@@ -6,6 +6,7 @@ import {
   SEARCH_LIMIT_DEFAULT,
   SEARCH_LIMIT_MAX,
   SEARCH_LIMIT_MIN,
+  resolveDataTtl,
 } from '../config';
 import { loadDatasetWithMeta } from '../data/loader';
 import {
@@ -20,12 +21,22 @@ import {
 import type { QuoteDataset } from '../data/types';
 import { publicRateLimit } from '../middleware/rateLimit';
 import type { Env } from '../types/env';
-import { ApiError, parseCsv, parseLimit, parseOffset } from '../utils/error';
-import { cachedOk, notModified, ok, plainText } from '../utils/response';
+import { ApiError, parseCsv, parseLimit, parseOffset, parseText } from '../utils/error';
+import { cachedOk, etagMatches, notModified, ok, plainText } from '../utils/response';
 
 const quotes = new Hono<{ Bindings: Env }>();
 
 quotes.use('*', publicRateLimit());
+
+/**
+ * 派生接口的浏览器 / CDN 缓存时长。
+ *
+ * 与数据集 TTL 取小：数据集最快会在 `DATA_TTL` 秒后被刷新，
+ * 若客户端缓存得比它还久，就会一直看到旧分类 / 旧标签。
+ */
+function catalogMaxAge(env: Env): number {
+  return Math.min(CATALOG_CACHE_MAX_AGE, resolveDataTtl(env));
+}
 
 /** 解析 format 参数，仅支持 json / text。 */
 function parseFormat(raw: string | undefined): 'json' | 'text' {
@@ -37,17 +48,21 @@ function parseFormat(raw: string | undefined): 'json' | 'text' {
 /**
  * 分类 / 标签这类「同一数据集内结果稳定」的接口统一响应：
  * 命中 `If-None-Match` 返回 304，否则返回带 ETag 与 Cache-Control 的 200。
+ *
+ * ETag 比较用宽松匹配（容忍 `W/` 前缀、多值列表与代理加的后缀），
+ * 否则客户端回传的等价 ETag 命中不了 304。
  */
 function respondCatalog(
   c: Context<{ Bindings: Env }>,
   dataset: QuoteDataset,
-  data: string[]
+  data: string[],
 ): Response {
   const etag = datasetEtag(dataset);
-  if (c.req.header('If-None-Match') === etag) {
-    return notModified(etag, CATALOG_CACHE_MAX_AGE);
+  const maxAge = catalogMaxAge(c.env);
+  if (etagMatches(c.req.header('If-None-Match'), etag)) {
+    return notModified(etag, maxAge);
   }
-  return cachedOk(data, etag, CATALOG_CACHE_MAX_AGE);
+  return cachedOk(data, etag, maxAge);
 }
 
 /** GET /api/quotes —— 随机返回一条或多条。 */
@@ -72,8 +87,8 @@ quotes.get('/', async (c) => {
 
 /** GET /api/quotes/search —— 关键词搜索 + 分类/标签过滤 + 分页。 */
 quotes.get('/search', async (c) => {
-  const q = c.req.query('q');
-  if (q === undefined || q.trim().length === 0) {
+  const q = parseText(c.req.query('q'), 'q');
+  if (q.length === 0) {
     throw ApiError.badRequest('缺少必填参数 q（至少 1 个字符）。');
   }
 
@@ -83,7 +98,7 @@ quotes.get('/search', async (c) => {
     c.req.query('limit'),
     SEARCH_LIMIT_DEFAULT,
     SEARCH_LIMIT_MIN,
-    SEARCH_LIMIT_MAX
+    SEARCH_LIMIT_MAX,
   );
   const offset = parseOffset(c.req.query('offset'));
 

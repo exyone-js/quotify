@@ -21,7 +21,7 @@
     "node": ">=22"
   },
   "dependencies": {
-    "hono": "^4.13.9"
+    "hono": "^4.13.12"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.22.0",

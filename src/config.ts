@@ -7,9 +7,9 @@ import type { Env } from './types/env';
  * 每个来源各存一份缓存，键后缀由**来源 URL 派生**（而非数组下标），
  * 这样增删 / 重排来源都不会导致缓存错位。
  */
-export const DATA_KEY_PREFIX = 'epigram:data:v1';
-export const META_KEY_PREFIX = 'epigram:meta:v1';
-export const MANIFEST_KEY_PREFIX = 'epigram:manifest:v1';
+export const DATA_KEY_PREFIX = 'quotify:data:v1';
+export const META_KEY_PREFIX = 'quotify:meta:v1';
+export const MANIFEST_KEY_PREFIX = 'quotify:manifest:v1';
 
 /** 单次加载允许的来源总数上限，避免清单失控导致上游调用爆炸。 */
 export const MAX_DATA_SOURCES = 20;
@@ -45,13 +45,13 @@ export function manifestKey(url: string): string {
 }
 
 /**
- * 默认「来源清单」地址：epigram-data 仓库根目录的 `sources.json`
+ * 默认「来源清单」地址：quotify-data 仓库根目录的 `sources.json`
  * （一个 JSON 字符串数组，每项是一个数据集文件地址）。
  *
  * 未显式配置 `DATA_MANIFEST_URL` 时使用它；显式配置为空字符串则表示关闭清单。
  */
 export const DEFAULT_MANIFEST_URL =
-  'https://raw.githubusercontent.com/exyone-js/epigram-data/main/sources.json';
+  'https://raw.githubusercontent.com/exyone-js/quotify-data/main/sources.json';
 
 /**
  * 默认静态来源：留空表示「默认不配置静态来源」，来源列表完全由清单文件解析得到。
@@ -153,7 +153,7 @@ export function limitSources(urls: readonly string[]): string[] {
   if (unique.length <= MAX_DATA_SOURCES) return unique;
 
   console.warn(
-    `[epigram] 数据来源过多（${unique.length} 个），只取前 ${MAX_DATA_SOURCES} 个（见 MAX_DATA_SOURCES）。`
+    `[quotify] 数据来源过多（${unique.length} 个），只取前 ${MAX_DATA_SOURCES} 个（见 MAX_DATA_SOURCES）。`
   );
   return unique.slice(0, MAX_DATA_SOURCES);
 }

@@ -1,4 +1,4 @@
-name = "epigram-api"
+name = "quotify-api"
 main = "src/index.ts"
 # 注意：本地测试链路（@cloudflare/vitest-pool-workers 内置的 miniflare/workerd）
 # 目前支持到 2026-08-22，因此这里取 2026-08-01 以保证 dev / test / deploy 三端一致。
@@ -13,11 +13,11 @@ ENVIRONMENT = "production"
 # 任意「公网可访问、且返回符合本项目数据格式的 JSON」的链接都可以，
 # 数据格式与校验规则见 README「数据仓库格式」。
 DATA_SOURCES = '[]'
-# 来源清单：指向 epigram-data 仓库根目录的 sources.json（JSON 字符串数组，每项是一个数据集地址）。
+# 来源清单：指向 quotify-data 仓库根目录的 sources.json（JSON 字符串数组，每项是一个数据集地址）。
 # 清单里的来源会与上面的 DATA_SOURCES 合并（去重、截断到 20 个）；
 # 增减来源只需改这个清单文件，不必重新部署 Worker。显式留空则关闭清单。
 # Fork 后请换成你自己的仓库地址，否则你改不动数据。
-DATA_MANIFEST_URL = "https://raw.githubusercontent.com/exyone-js/epigram-data/main/sources.json"
+DATA_MANIFEST_URL = "https://raw.githubusercontent.com/exyone-js/quotify-data/main/sources.json"
 DATA_TTL = "300"
 # 访问根域（`/`）时 302 跳转的目标（站内绝对路径），默认指向公开随机一言接口
 ROOT_REDIRECT = "/api/quotes/"
@@ -27,7 +27,7 @@ ADMIN_TOKEN = "dev-secret-token"
 [[kv_namespaces]]
 binding = "CACHE"
 # KV 命名空间：下面的 id 属于本项目作者，Fork 后你无权访问，必须换成自己的。
-# 创建命令：npx wrangler kv namespace create epigram-cache
+# 创建命令：npx wrangler kv namespace create quotify-cache
 # 然后用输出结果里的 id 覆盖下一行（完整部署步骤见 README「部署」章节）。
 id = "b38989b10a4d4a119bd6bb8adc93e21b"
 

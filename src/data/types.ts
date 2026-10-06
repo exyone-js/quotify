@@ -8,14 +8,14 @@ export interface Quote {
   tags?: string[];
 }
 
-/** GitHub 仓库 `epigram-data/data.json` 的完整结构。 */
+/** GitHub 仓库 `quotify-data/data.json` 的完整结构。 */
 export interface QuoteDataset {
   version: number;
   updated_at: string;
   quotes: Quote[];
 }
 
-/** `epigram:meta:v1` 中保存的缓存元信息。 */
+/** `quotify:meta:v1` 中保存的缓存元信息。 */
 export interface DatasetMeta {
   loaded_at: number;
   source_url: string;

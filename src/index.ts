@@ -24,7 +24,7 @@ app.use('*', cors());
 app.get('/api/health', async (c) => {
   const { cached, loadedAt, total, sourcesLoaded, sourcesTotal } = await peekCache(c.env);
   return ok({
-    service: 'epigram',
+    service: 'quotify',
     environment: c.env.ENVIRONMENT ?? 'unknown',
     cached,
     cache_loaded_at: loadedAt,
@@ -58,7 +58,7 @@ app.notFound((c) => {
 // 7. 顶层错误处理：统一 JSON 结构 + 非阻塞日志。
 app.onError((err, c) => {
   const { status, message } = toErrorResponse(err);
-  const line = `[epigram] ${c.req.method} ${c.req.url} -> ${status} ${message}`;
+  const line = `[quotify] ${c.req.method} ${c.req.url} -> ${status} ${message}`;
 
   try {
     c.executionCtx.waitUntil(Promise.resolve(console.error(line, err)));

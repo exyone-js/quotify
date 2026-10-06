@@ -1,8 +1,8 @@
 {
-  "name": "epigram-api",
+  "name": "quotify-api",
   "version": "1.0.0",
   "private": true,
-  "description": "Production-grade epigram (quote) API on Cloudflare Workers, backed by a GitHub-hosted JSON dataset with KV lazy caching.",
+  "description": "Production-grade Quotify (quote) API on Cloudflare Workers, backed by a GitHub-hosted JSON dataset with KV lazy caching.",
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",

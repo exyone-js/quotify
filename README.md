@@ -1,6 +1,6 @@
-# epigram · 隽语 API
+# Quotify · 引语 API
 
-> 中文名 **隽语**（即 `epigram` 的意译），是一个仿「一言（Hitokoto）」的引语 API 实现。
+> **Quotify**（取自 `quote`）是一个仿「一言（Hitokoto）」的引语 API 实现，中文名 **引语**。
 > 功能定位参考一言（随机返回一条或多条引语），但接口约定自成一套，**并非** Hitokoto 的兼容实现。
 
 运行在 **Cloudflare Workers** 上的生产级引语 API：随机返回引语，并支持分类 / 标签筛选与关键词搜索。
@@ -27,16 +27,16 @@
 数据源 0..n（GitHub raw / 任意 HTTPS）
    │  data.json × n（每个来源格式相同）
    ▼
-Cloudflare Worker (epigram-api)
+Cloudflare Worker (quotify-api)
    │  1. 进程内热缓存（60s，避免每请求重复解析）—— 命中即返回
    │  2. 解析来源列表 = DATA_SOURCES + 清单（去重、截断到 20 个）
-   │  3. 并发查各来源的 KV 缓存 (epigram:data:v1:<URL 指纹>)
+   │  3. 并发查各来源的 KV 缓存 (quotify:data:v1:<URL 指纹>)
    │  4. 未命中 / 过期 → 并发回源
    │     （5s 超时 + 边缘缓存 60s；携带 If-None-Match，304 则复用旧数据并续期）
    │  5. 校验 JSON → 各来源回写自己的 KV (TTL 300s) + meta（含来源 URL 与上游 ETag）
    │  6. 合并所有可用来源为一个总池（单个来源失败只跳过它，不拖垮整体）
    ▼
-Cloudflare KV (epigram-cache)
+Cloudflare KV (quotify-cache)
    ▼
 API 响应
 ```
@@ -47,7 +47,7 @@ API 响应
 ## 目录结构
 
 ```text
-epigram/
+quotify/
 ├── src/
 │   ├── index.ts              # Worker 入口：安全头、CORS、根域重定向、健康检查、路由挂载、统一错误处理
 │   ├── config.ts             # 常量、KV 键（URL 指纹）、来源列表解析、默认配置
@@ -70,7 +70,7 @@ epigram/
 │       └── env.ts            # 应用面向的 Env 绑定视图
 ├── tests/api.test.ts         # 集成 / 单元测试
 ├── .github/workflows/ci.yml  # CI：typecheck + test
-├── data/data.json            # 示例数据集（推送到 epigram-data 仓库）
+├── data/data.json            # 示例数据集（推送到 quotify-data 仓库）
 ├── wrangler.toml
 ├── vitest.config.ts
 ├── tsconfig.json
@@ -84,18 +84,18 @@ epigram/
 | 层 | 用词 | 示例 |
 |:---|:---|:---|
 | 公开契约 + 数据模型 | `quote` | `GET /api/quotes`、数据集字段 `quotes`、类型 `Quote` / `QuoteDataset` |
-| 项目 / 品牌标识 | `epigram` | 包名 `epigram-api`、KV 键前缀 `epigram:`、`service: "epigram"` |
+| 项目 / 品牌标识 | `quotify` | 包名 `quotify-api`、KV 键前缀 `quotify:`、`service: "quotify"` |
 
 公开接口、数据集字段与代码类型统一使用通用的 `quote`：
 
 - **语义准确**：本 API 收录的是「有出处、有作者的引语」——诗词、骈文、戏剧台词、箴言、讲义摘句，
-  正是 `quote` / `quotation` 的范畴；相比之下 `epigram`（多指机智、带讽刺的短句）语义偏窄。
+  正是 `quote` / `quotation` 的范畴，`Quotify` 这一项目名也正是由此而来。
 - **契约友好**：路径与数据集字段是长期对外契约且最难变更，通用词对使用者更友好，
   也是这类 API 的通行叫法。
 
-`epigram` 仅作为项目品牌保留在包名、KV 键前缀与服务标识中，不再出现在对外契约里。
+`Quotify` / `quotify` 只作为项目品牌保留在包名、KV 键前缀与服务标识中，不再出现在对外契约里。
 
-> 中文名「**隽语**」是 `epigram` 的意译，仅用于对外称呼与文档表述，不参与任何标识符命名。
+> 中文名「**引语**」是 `quote` 的直译，仅用于对外称呼与文档表述，不参与任何标识符命名。
 
 ## API 文档
 
@@ -112,7 +112,7 @@ epigram/
 
 ### `GET /` — 根域自动重定向
 
-直接访问根域（例如 `https://epigram-api.<your-subdomain>.workers.dev/`）会 **302** 跳转到
+直接访问根域（例如 `https://quotify-api.<your-subdomain>.workers.dev/`）会 **302** 跳转到
 `/api/quotes/`，避免用户看到裸 404。跳转只改写路径、**保留原始查询串**，
 因此 `/?limit=5&format=text` 等价于 `/api/quotes/?limit=5&format=text`。
 
@@ -161,7 +161,7 @@ epigram/
 {
   "status": 200,
   "message": "ok.",
-  "data": { "service": "epigram", "environment": "production", "cached": true, "cache_loaded_at": 1759000000000, "total": 1204, "sources": { "loaded": 2, "total": 2 } },
+  "data": { "service": "quotify", "environment": "production", "cached": true, "cache_loaded_at": 1759000000000, "total": 1204, "sources": { "loaded": 2, "total": 2 } },
   "ts": 1759000000123
 }
 ```
@@ -190,14 +190,14 @@ epigram/
 
 ## 数据仓库格式
 
-数据集放在独立仓库 **`epigram-data`**：按 `category` 拆分到 `data/` 下的多个文件，
+数据集放在独立仓库 **`quotify-data`**：按 `category` 拆分到 `data/` 下的多个文件，
 根目录的 `sources.json`（**来源清单**）列出这些文件的地址。
 
 本项目的默认配置就是这样——`DATA_SOURCES` 留空、`DATA_MANIFEST_URL` 指向该清单，
 所以**维护数据不需要重新部署 Worker**：新增一个分类只需在 `data/` 加文件并登记到 `sources.json`。
 
 ```text
-epigram-data/
+quotify-data/
 ├── sources.json          # 来源清单（列出下面全部数据文件）
 └── data/
     ├── internet.json     # 网络
@@ -242,9 +242,9 @@ KV 键设计：
 
 | 键 | 值 | 说明 |
 |:---|:---|:---|
-| `epigram:data:v1:<URL 指纹>` | JSON 字符串 | 该来源的数据集（指纹 = 来源 URL 的 FNV-1a 哈希） |
-| `epigram:meta:v1:<URL 指纹>` | JSON 字符串 | `{ loaded_at, source_url, etag? }`；`source_url` 用于校验缓存归属，`etag` 用于条件请求 |
-| `epigram:manifest:v1:<URL 指纹>` | JSON 字符串 | 来源清单缓存：`{ raw, loadedAt, etag }`（未配置清单时不产生） |
+| `quotify:data:v1:<URL 指纹>` | JSON 字符串 | 该来源的数据集（指纹 = 来源 URL 的 FNV-1a 哈希） |
+| `quotify:meta:v1:<URL 指纹>` | JSON 字符串 | `{ loaded_at, source_url, etag? }`；`source_url` 用于校验缓存归属，`etag` 用于条件请求 |
+| `quotify:manifest:v1:<URL 指纹>` | JSON 字符串 | 来源清单缓存：`{ raw, loadedAt, etag }`（未配置清单时不产生） |
 
 键后缀由**来源 URL** 派生而不是数组下标，因此增删 / 重排来源都不会让某个来源读到别人的缓存；
 读取时还会比对 meta 里的 `source_url`，即使哈希碰撞也只会退化成一次「未命中 + 回源」。
@@ -254,7 +254,7 @@ KV 键设计：
 | 名称 | 类型 | 默认 | 说明 |
 |:---|:---|:---|:---|
 | `DATA_SOURCES` | var | `[]`（不配置静态来源） | 数据集来源列表（**JSON 字符串数组**）。默认留空——来源全部由清单提供；需要静态兜底（清单不可用时仍有内容）时在此列出 |
-| `DATA_MANIFEST_URL` | var | 作者的 `epigram-data/sources.json` | **来源清单**地址（JSON 字符串数组），与 `DATA_SOURCES` 合并去重（上限 20）。改清单即可动态增减来源、**无需重新部署**；显式留空则关闭清单 |
+| `DATA_MANIFEST_URL` | var | 作者的 `quotify-data/sources.json` | **来源清单**地址（JSON 字符串数组），与 `DATA_SOURCES` 合并去重（上限 20）。改清单即可动态增减来源、**无需重新部署**；显式留空则关闭清单 |
 | `DATA_TTL` | var | `300` | KV 缓存 TTL（秒） |
 | `ROOT_REDIRECT` | var | `/api/quotes/` | 根路径 302 重定向目标（仅接受站内绝对路径） |
 | `ENVIRONMENT` | var | `production` | 环境标识 |
@@ -293,7 +293,7 @@ npm run cf-typegen # 修改 wrangler.toml 后重新生成 worker-configuration.d
 > `worker-configuration.d.ts` 由 `wrangler types` 生成（包含 `KVNamespace`、`RateLimit` 等运行时类型
 > 以及全局 `Env`），修改 `wrangler.toml` 后需要重新生成。
 
-## 自建部署教程（Fork 并托管自己的隽语 API）
+## 自建部署教程（Fork 并托管自己的引语 API）
 
 面向「Fork 一份、换成自己的数据集、部署到自己的 Cloudflare 账号」的场景。
 下面每一步都对应 `wrangler.toml` 里的注释，照着改即可。
@@ -312,7 +312,7 @@ npm run cf-typegen # 修改 wrangler.toml 后重新生成 worker-configuration.d
 **根字段必须是 `quotes`**，每条记录至少要有非空的 `id` 与 `content`。
 
 可以直接复制本仓库的 [data/data.json](data/data.json) 当**单文件**模板，
-或参考作者仓库 `epigram-data` 的**按分类拆分**结构。
+或参考作者仓库 `quotify-data` 的**按分类拆分**结构。
 
 > `wrangler.toml` 中 `DATA_SOURCES` 的注释写着「任意公网可访问、且返回符合本项目数据格式的 JSON 的链接都可以」——
 > 也就是说数据集**不一定要放在 GitHub**，你自己的静态服务器 / 对象存储同样可行，只要 URL 公网可读。
@@ -353,7 +353,7 @@ DATA_MANIFEST_URL = ""
 ### 3. 创建你自己的 KV 命名空间
 
 ```bash
-npx wrangler kv namespace create epigram-cache
+npx wrangler kv namespace create quotify-cache
 ```
 
 命令会输出一个 `id`，用它覆盖 `wrangler.toml` 里 `[[kv_namespaces]].id`：
@@ -398,12 +398,12 @@ npx wrangler secret put ADMIN_TOKEN
 npx wrangler deploy
 ```
 
-部署完成后终端会输出形如 `https://epigram-api.<你的子域>.workers.dev` 的访问地址。
+部署完成后终端会输出形如 `https://quotify-api.<你的子域>.workers.dev` 的访问地址。
 
 ### 7. 首次预热与验证
 
 ```bash
-BASE=https://epigram-api.<你的子域>.workers.dev
+BASE=https://quotify-api.<你的子域>.workers.dev
 
 curl "$BASE/api/health"      # 首次：cached=false、total=0（KV 还是空的）
 curl "$BASE/api/quotes"      # 触发首次回源，返回你自己的数据
@@ -438,7 +438,7 @@ curl -X POST -H "Authorization: Bearer <你的 ADMIN_TOKEN>" "$BASE/api/admin/re
 ## curl 调用示例清单
 
 ```bash
-BASE=https://epigram-api.<your-subdomain>.workers.dev
+BASE=https://quotify-api.<your-subdomain>.workers.dev
 
 # 根域自动重定向（302 → /api/quotes/）
 curl -i "$BASE/"
@@ -489,10 +489,10 @@ curl -H "Authorization: Bearer $ADMIN_TOKEN" "$BASE/api/admin/stats"
 
 ## 生产验证清单
 
-1. `npm test` —— 37 个用例全部通过。
+1. `npm test` —— 54 个用例全部通过。
 2. `npm run typecheck` —— 无类型错误。
 3. `curl -i "$BASE/"` —— 返回 `302` 且 `Location` 指向 `/api/quotes/`。
-4. `curl "$BASE/api/health"` —— `status=200`、`data.service="epigram"`，且 `data.sources` 显示「已缓存 / 配置总数」。
+4. `curl "$BASE/api/health"` —— `status=200`、`data.service="quotify"`，且 `data.sources` 显示「已缓存 / 配置总数」。
 5. 首次 `curl "$BASE/api/quotes"` —— 返回数据且 KV 被写入；再次请求 `data.cached` 为 `true`。
 6. `curl -i -X OPTIONS "$BASE/api/quotes"` —— 返回 `Access-Control-Allow-Origin: *`。
 7. `curl -i "$BASE/api/health"` —— 含 `X-Content-Type-Options: nosniff` 与 `Referrer-Policy: no-referrer`。

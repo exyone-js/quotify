@@ -7,7 +7,7 @@ interface __BaseEnv_Env {
 	ADMIN_RATE_LIMITER: RateLimit;
 	ENVIRONMENT: "production";
 	DATA_SOURCES: "[]";
-	DATA_MANIFEST_URL: "https://raw.githubusercontent.com/exyone-js/epigram-data/main/sources.json";
+	DATA_MANIFEST_URL: "https://raw.githubusercontent.com/exyone-js/quotify-data/main/sources.json";
 	DATA_TTL: "300";
 	ROOT_REDIRECT: "/api/quotes/";
 	ADMIN_TOKEN: "dev-secret-token";

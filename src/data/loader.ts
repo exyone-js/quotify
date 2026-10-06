@@ -278,7 +278,7 @@ async function readSnapshot(env: Env, url: string): Promise<SourceSnapshot | nul
     const meta = parseMeta(metaRaw);
     if (meta.sourceUrl !== null && meta.sourceUrl !== url) {
       console.warn(
-        `[epigram] 缓存来源不匹配（期望 ${url}，实际 ${meta.sourceUrl}），忽略该缓存并回源。`
+        `[quotify] 缓存来源不匹配（期望 ${url}，实际 ${meta.sourceUrl}），忽略该缓存并回源。`
       );
       return null;
     }
@@ -289,7 +289,7 @@ async function readSnapshot(env: Env, url: string): Promise<SourceSnapshot | nul
       etag: meta.etag,
     };
   } catch (err) {
-    console.error(`[epigram] KV 缓存损坏（${url}），已删除并回源：`, err);
+    console.error(`[quotify] KV 缓存损坏（${url}），已删除并回源：`, err);
     await Promise.all([env.CACHE.delete(dataKey(url)), env.CACHE.delete(metaKey(url))]);
     return null;
   }
@@ -312,7 +312,7 @@ async function fetchUpstream(url: string, etag: string | null): Promise<Upstream
 
   try {
     const headers: Record<string, string> = {
-      'User-Agent': 'epigram-worker',
+      'User-Agent': 'quotify-worker',
       Accept: 'application/json',
     };
     if (etag !== null) headers['If-None-Match'] = etag;
@@ -421,7 +421,7 @@ async function readManifestRecord(env: Env, key: string): Promise<ManifestRecord
       etag: typeof record.etag === 'string' && record.etag.length > 0 ? record.etag : null,
     };
   } catch (err) {
-    console.error('[epigram] 清单缓存损坏，已删除：', err);
+    console.error('[quotify] 清单缓存损坏，已删除：', err);
     await env.CACHE.delete(key);
     return null;
   }
@@ -451,7 +451,7 @@ function parseManifestUrls(raw: string, url: string): string[] | null {
     return parseSourceList(raw, `清单文件 ${url}`);
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err);
-    console.error(`[epigram] 清单文件格式非法（${url}）：${reason}`);
+    console.error(`[quotify] 清单文件格式非法（${url}）：${reason}`);
     return null;
   }
 }
@@ -511,7 +511,7 @@ async function loadManifest(
     return done(parsed, null);
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err);
-    console.error(`[epigram] 清单文件加载失败（${url}）：${reason}`);
+    console.error(`[quotify] 清单文件加载失败（${url}）：${reason}`);
     return done(cachedUrls(), reason);
   }
 }
@@ -537,7 +537,7 @@ async function loadAggregate(env: Env, baseline: string[], force: boolean): Prom
         return { state: await loadSource(env, url, force), failure: null };
       } catch (err) {
         const reason = err instanceof Error ? err.message : String(err);
-        console.error(`[epigram] 数据来源加载失败（${url}）：${reason}`);
+        console.error(`[quotify] 数据来源加载失败（${url}）：${reason}`);
         return { state: null, failure: { url, error: reason } };
       }
     })

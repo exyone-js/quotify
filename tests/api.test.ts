@@ -142,7 +142,7 @@ const DATASET_B = {
 /** 默认来源清单（由 wrangler.toml 的 DATA_MANIFEST_URL 提供，测试环境必定存在）。 */
 const DEFAULT_MANIFEST = resolveManifestUrl(env as unknown as Env) as string;
 /** 默认清单里列出的数据集地址（测试桩按此地址返回 DATASET）。 */
-const SOURCE_URL = 'https://raw.githubusercontent.com/exyone-js/epigram-data/main/data/literature.json';
+const SOURCE_URL = 'https://raw.githubusercontent.com/exyone-js/quotify-data/main/data/literature.json';
 /** 多来源 / 自定义清单用例使用的地址。 */
 const SOURCE_A = 'https://example.test/a.json';
 const SOURCE_B = 'https://example.test/b.json';
@@ -162,7 +162,7 @@ const CACHE_KEYS = [
   manifestKey(DEFAULT_MANIFEST),
   manifestKey(CUSTOM_MANIFEST_URL),
 ];
-const BASE = 'https://epigram.test';
+const BASE = 'https://quotify.test';
 const ADMIN_TOKEN = 'dev-secret-token';
 
 /** 上游被调用的次数，用于验证懒加载与缓存命中。 */
@@ -218,7 +218,7 @@ afterEach(() => {
 });
 
 describe('GET /api/health', () => {
-  it('1. 返回 200 且 data.service === "epigram"', async () => {
+  it('1. 返回 200 且 data.service === "quotify"', async () => {
     const { res, body } = await call<{
       service: string;
       cached: boolean;
@@ -229,7 +229,7 @@ describe('GET /api/health', () => {
     expect(res.status).toBe(200);
     expect(res.headers.get('Access-Control-Allow-Origin')).toBe('*');
     expect(body.status).toBe(200);
-    expect(body.data.service).toBe('epigram');
+    expect(body.data.service).toBe('quotify');
     expect(typeof body.data.total).toBe('number');
     // 冷启动：清单尚未缓存，无法枚举来源 → 0/0（健康检查不回源，这是预期行为）
     expect(body.data.cached).toBe(false);
